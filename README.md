@@ -77,7 +77,15 @@ ansible-galaxy collection install -r requirements.yml
 
 ## Quick start
 
-### Step 1 — Edit your inventory
+### Step 1 — Create your inventory from the example templates
+
+Inventory `.ini` files are gitignored (they contain real IPs and key paths).
+Copy the example files and fill in your values:
+
+```bash
+cp inventory/cloud.ini.example   inventory/cloud.ini   # for AWS
+cp inventory/onprem.ini.example  inventory/onprem.ini  # for on-prem
+```
 
 **AWS** (`inventory/cloud.ini`):
 ```ini

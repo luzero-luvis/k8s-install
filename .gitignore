@@ -3,6 +3,10 @@
 .ansible/
 ansible.log
 
+# Inventory files contain real IPs, usernames, and key paths — never commit them.
+# Commit only the *.example files; copy to *.ini locally before use.
+inventory/*.ini
+
 # Vault-encrypted files are fine to commit; plaintext secrets are not
 *vault-password*
 vault.pass
