@@ -1,0 +1,53 @@
+# ── Ansible ────────────────────────────────────────────────────────────────
+*.retry
+.ansible/
+ansible.log
+
+# Vault-encrypted files are fine to commit; plaintext secrets are not
+*vault-password*
+vault.pass
+.vault_pass
+secret.yml
+secrets.yml
+credentials.yml
+
+# Dynamic inventory cache
+inventory/.cache/
+inventory/hosts.json
+
+# ── SSH keys ───────────────────────────────────────────────────────────────
+*.pem
+*.key
+id_rsa
+id_ed25519
+id_ecdsa
+*.ppk
+
+# ── Terraform (if used alongside) ─────────────────────────────────────────
+*.tfstate
+*.tfstate.backup
+*.tfvars
+.terraform/
+.terraform.lock.hcl
+
+# ── OS / editor ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# ── Logs & temp ───────────────────────────────────────────────────────────
+*.log
+/tmp/

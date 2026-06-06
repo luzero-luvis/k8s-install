@@ -1,0 +1,89 @@
+---
+- name: Add Docker GPG key (containerd repo)
+  shell: |
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+      | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+  args:
+    creates: /usr/share/keyrings/docker-archive-keyring.gpg
+  when: ansible_os_family == "Debian"
+
+- name: Add Docker apt repository (containerd)
+  apt_repository:
+    repo: "deb [arch={{ ansible_architecture }} signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    state: present
+    filename: docker
+  when: ansible_os_family == "Debian"
+
+- name: Add Docker yum repository (containerd)
+  yum_repository:
+    name: docker-ce
+    description: Docker CE Stable
+    baseurl: https://download.docker.com/linux/centos/$releasever/$basearch/stable
+    gpgcheck: true
+    gpgkey: https://download.docker.com/linux/centos/gpg
+    enabled: true
+  when: ansible_os_family == "RedHat"
+
+- name: Install containerd.io
+  apt:
+    name: containerd.io
+    state: present
+    update_cache: true
+  when: ansible_os_family == "Debian"
+
+- name: Install containerd.io (RedHat)
+  yum:
+    name: containerd.io
+    state: present
+  when: ansible_os_family == "RedHat"
+
+- name: Create containerd config directory
+  file:
+    path: "{{ containerd_config_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Create containerd certs.d directory
+  file:
+    path: "{{ containerd_config_dir }}/certs.d"
+    state: directory
+    mode: "0755"
+
+- name: Generate default containerd config
+  command: containerd config default
+  register: containerd_default_config
+  changed_when: false
+
+- name: Write containerd config
+  copy:
+    content: "{{ containerd_default_config.stdout }}"
+    dest: "{{ containerd_config_dir }}/config.toml"
+    mode: "0644"
+  notify: restart containerd
+
+- name: Enable SystemdCgroup in containerd config
+  replace:
+    path: "{{ containerd_config_dir }}/config.toml"
+    regexp: 'SystemdCgroup = false'
+    replace: 'SystemdCgroup = true'
+  notify: restart containerd
+
+- name: Set sandbox_image to pause:3.10
+  replace:
+    path: "{{ containerd_config_dir }}/config.toml"
+    regexp: '^\s*sandbox_image\s*=\s*".*"'
+    replace: '    sandbox_image = "registry.k8s.io/pause:3.10"'
+  notify: restart containerd
+
+- name: Set config_path for containerd registry certs
+  replace:
+    path: "{{ containerd_config_dir }}/config.toml"
+    regexp: '^\s*config_path\s*=\s*""'
+    replace: '      config_path = "/etc/containerd/certs.d"'
+  notify: restart containerd
+
+- name: Enable and start containerd
+  service:
+    name: containerd
+    state: started
+    enabled: true

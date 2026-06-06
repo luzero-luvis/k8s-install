@@ -1,0 +1,16 @@
+---
+- name: Check if node is already joined
+  stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: kubelet_conf
+
+- name: Join cluster
+  command: "{{ hostvars[groups['masters'][0]].kubeadm_join_command }}"
+  when: not kubelet_conf.stat.exists
+  register: join_result
+
+- name: Confirm kubelet is running after join
+  service:
+    name: kubelet
+    state: started
+    enabled: true

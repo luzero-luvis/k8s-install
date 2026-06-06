@@ -1,0 +1,50 @@
+---
+# ──────────────────────────────────────────────
+# Kubernetes version
+# ──────────────────────────────────────────────
+kubernetes_version: "1.36"
+kubernetes_apt_keyring_path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+# ──────────────────────────────────────────────
+# Containerd
+# ──────────────────────────────────────────────
+containerd_config_dir: /etc/containerd
+
+# ──────────────────────────────────────────────
+# Pod & Service networking — Cilium
+# ──────────────────────────────────────────────
+pod_network_cidr: "10.0.0.0/8"
+service_cidr: "10.96.0.0/12"
+
+cilium_version: "1.19.4"
+cilium_helm_release: cilium
+cilium_helm_namespace: kube-system
+
+# ──────────────────────────────────────────────
+# kubeadm API server endpoint
+# Leave empty to auto-detect the master's primary IP.
+# Set explicitly for HA setups or load-balanced endpoints.
+# ──────────────────────────────────────────────
+apiserver_advertise_address: ""
+apiserver_extra_sans: []
+
+# ──────────────────────────────────────────────
+# Join token TTL
+# ──────────────────────────────────────────────
+kubeadm_token_ttl: "24h"
+
+# ──────────────────────────────────────────────
+# Environment-specific toggles
+# ──────────────────────────────────────────────
+# Cloud provider: aws | gcp | azure | onprem
+# Used to conditionally configure kubelet provider-id and IMDSv2 metadata.
+cloud_provider: onprem
+
+# true on cloud where SG/firewall rules are managed externally
+disable_host_firewall: false
+
+# On-prem usually needs NTP; cloud VMs typically have it
+configure_ntp: true
+ntp_servers:
+  - "0.pool.ntp.org"
+  - "1.pool.ntp.org"

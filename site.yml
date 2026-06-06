@@ -1,0 +1,28 @@
+---
+# Kubernetes cluster installation — master + workers with Cilium CNI
+# Usage:
+#   Cloud:   ansible-playbook -i inventory/cloud.ini site.yml
+#   On-prem: ansible-playbook -i inventory/onprem.ini site.yml
+
+- name: Common OS preparation (all nodes)
+  hosts: k8s_cluster
+  become: true
+  gather_facts: true
+  roles:
+    - common
+    - containerd
+    - kubernetes
+
+- name: Initialize Kubernetes master and install Cilium
+  hosts: masters
+  become: true
+  gather_facts: true
+  roles:
+    - master
+
+- name: Join worker nodes to the cluster
+  hosts: workers
+  become: true
+  gather_facts: true
+  roles:
+    - worker

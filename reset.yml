@@ -1,0 +1,47 @@
+---
+# Tear down the cluster and reset all nodes to a clean state.
+# Usage: ansible-playbook -i inventory/<cloud|onprem>.ini reset.yml
+# WARNING: this is destructive and irreversible.
+
+- name: Reset all Kubernetes nodes
+  hosts: k8s_cluster
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Run kubeadm reset
+      command: kubeadm reset -f
+      ignore_errors: true
+
+    - name: Remove CNI config
+      file:
+        path: /etc/cni
+        state: absent
+
+    - name: Remove .kube directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /root/.kube
+        - "/home/{{ ansible_user }}/.kube"
+
+    - name: Remove Cilium Helm release artifacts (master only)
+      command: helm uninstall cilium -n kube-system
+      ignore_errors: true
+      when: inventory_hostname in groups['masters']
+
+    - name: Flush iptables
+      command: "{{ item }}"
+      loop:
+        - iptables -F
+        - iptables -X
+        - iptables -t nat -F
+        - iptables -t nat -X
+        - iptables -t mangle -F
+        - iptables -t mangle -X
+      ignore_errors: true
+
+    - name: Restart containerd
+      service:
+        name: containerd
+        state: restarted
