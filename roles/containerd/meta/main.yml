@@ -1,0 +1,13 @@
+---
+galaxy_info:
+  role_name: containerd
+  author: luvis-sirpi
+  description: Install and configure containerd runtime
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Ubuntu
+      versions: [jammy, noble]
+    - name: EL
+      versions: ["9"]
+dependencies:
+  - role: common

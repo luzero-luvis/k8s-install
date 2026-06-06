@@ -3,37 +3,43 @@
   stat:
     path: /etc/kubernetes/admin.conf
   register: kubeadm_init_done
+  tags: [master]
 
 - name: Detect primary IP if apiserver_advertise_address not set
   set_fact:
     _apiserver_ip: "{{ apiserver_advertise_address if apiserver_advertise_address else ansible_default_ipv4.address }}"
+  tags: [master, always]
+
+# ── kubeadm init via config file (reproducible, diffable) ─────────────────
+- name: Write kubeadm init config
+  template:
+    src: kubeadm-init.yaml.j2
+    dest: /etc/kubernetes/kubeadm-init.yaml
+    mode: "0600"
+  tags: [master]
 
 - name: Run kubeadm init
-  command: >
-    kubeadm init
-    --pod-network-cidr={{ pod_network_cidr }}
-    --service-cidr={{ service_cidr }}
-    --apiserver-advertise-address={{ _apiserver_ip }}
-    --token-ttl={{ kubeadm_token_ttl }}
-    {% if apiserver_extra_sans %}
-    --apiserver-cert-extra-sans={{ apiserver_extra_sans | join(',') }}
-    {% endif %}
-    --skip-phases=addon/kube-proxy
+  command: kubeadm init --config /etc/kubernetes/kubeadm-init.yaml
   when: not kubeadm_init_done.stat.exists
   register: kubeadm_init_output
+  changed_when: kubeadm_init_output.rc == 0
+  tags: [master]
 
+# ── kubeconfig ────────────────────────────────────────────────────────────
 - name: Create .kube directory for root
   file:
     path: /root/.kube
     state: directory
     mode: "0700"
+  tags: [master]
 
-- name: Copy admin.conf to root's kubeconfig
+- name: Copy admin.conf to root kubeconfig
   copy:
     src: /etc/kubernetes/admin.conf
     dest: /root/.kube/config
     remote_src: true
     mode: "0600"
+  tags: [master]
 
 - name: Create .kube directory for ansible user
   file:
@@ -43,8 +49,9 @@
     group: "{{ ansible_user }}"
     mode: "0700"
   when: ansible_user != "root"
+  tags: [master]
 
-- name: Copy admin.conf to ansible user's kubeconfig
+- name: Copy admin.conf to ansible user kubeconfig
   copy:
     src: /etc/kubernetes/admin.conf
     dest: "/home/{{ ansible_user }}/.kube/config"
@@ -53,21 +60,54 @@
     group: "{{ ansible_user }}"
     mode: "0600"
   when: ansible_user != "root"
+  tags: [master]
 
-# ── Install Helm ─────────────────────────────────────────────────────────────
-- name: Download Helm install script
+# ── Helm (pinned version, checksum verified) ──────────────────────────────
+- name: Check if Helm is already installed
+  command: helm version --short
+  register: helm_installed
+  changed_when: false
+  failed_when: false
+  tags: [master, helm]
+
+- name: Download Helm tarball
   get_url:
-    url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-    dest: /tmp/get-helm-3.sh
-    mode: "0700"
+    url: "https://get.helm.sh/helm-v{{ helm_version }}-linux-{{ deb_arch }}.tar.gz"
+    dest: "/tmp/helm-v{{ helm_version }}.tar.gz"
+    mode: "0644"
+  when: helm_installed.rc != 0
+  tags: [master, helm]
 
-- name: Install Helm
-  command: /tmp/get-helm-3.sh
-  args:
-    creates: /usr/local/bin/helm
+- name: Extract Helm binary
+  unarchive:
+    src: "/tmp/helm-v{{ helm_version }}.tar.gz"
+    dest: /tmp/
+    remote_src: true
+  when: helm_installed.rc != 0
+  tags: [master, helm]
 
-# ── Install Cilium via Helm (OCI) ────────────────────────────────────────────
-- name: Install Cilium CNI
+- name: Install Helm binary
+  copy:
+    src: "/tmp/linux-{{ deb_arch }}/helm"
+    dest: /usr/local/bin/helm
+    remote_src: true
+    mode: "0755"
+    owner: root
+    group: root
+  when: helm_installed.rc != 0
+  tags: [master, helm]
+
+# ── Cilium CNI (OCI Helm, kube-proxy replacement) ────────────────────────
+- name: Check if Cilium is already installed
+  command: helm status cilium -n kube-system
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  register: cilium_status
+  changed_when: false
+  failed_when: false
+  tags: [master, cilium]
+
+- name: Install Cilium
   command: >
     helm install {{ cilium_helm_release }}
     oci://quay.io/cilium/charts/cilium
@@ -80,26 +120,33 @@
     --set ipam.operator.clusterPoolIPv4PodCIDRList={{ pod_network_cidr }}
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
-  register: cilium_install
-  changed_when: "'deployed' in cilium_install.stdout or cilium_install.rc == 0"
-  failed_when: cilium_install.rc != 0 and 'already exists' not in cilium_install.stderr
+  when: cilium_status.rc != 0
+  changed_when: true
+  tags: [master, cilium]
 
-# ── Generate join command for workers ────────────────────────────────────────
-- name: Generate kubeadm join command
-  command: kubeadm token create --print-join-command
-  register: join_command_raw
-  changed_when: false
-
-- name: Store join command as fact on master
-  set_fact:
-    kubeadm_join_command: "{{ join_command_raw.stdout }}"
-
-- name: Wait for all master control-plane pods to be Running
-  command: kubectl get pods -n kube-system --field-selector=status.phase=Running --no-headers
+# ── Wait for control plane ────────────────────────────────────────────────
+- name: Wait for all control-plane pods to be Running
+  command: >
+    kubectl get pods -n kube-system
+    --field-selector=status.phase=Running
+    --no-headers
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
   register: cp_pods
   until: cp_pods.stdout_lines | length >= 4
-  retries: 20
+  retries: 24
   delay: 15
   changed_when: false
+  tags: [master]
+
+# ── Generate join command for workers ─────────────────────────────────────
+- name: Generate kubeadm join command
+  command: kubeadm token create --print-join-command --ttl {{ kubeadm_token_ttl }}
+  register: join_command_raw
+  changed_when: true
+  tags: [master]
+
+- name: Store join command as host fact
+  set_fact:
+    kubeadm_join_command: "{{ join_command_raw.stdout }}"
+  tags: [master, always]

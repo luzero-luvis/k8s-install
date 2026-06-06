@@ -1,7 +1,19 @@
 ---
+# ── Architecture & OS facts ────────────────────────────────────────────────
+- name: Set deb architecture fact
+  set_fact:
+    deb_arch: "{{ arch_map[ansible_architecture] }}"
+    # chrony service name differs by OS family
+    chrony_svc: "{{ 'chrony' if ansible_os_family == 'Debian' else 'chronyd' }}"
+    # kubelet extra-args file path differs by OS family
+    kubelet_env_file: "{{ '/etc/sysconfig/kubelet' if ansible_os_family == 'RedHat' else '/etc/default/kubelet' }}"
+  tags: [always]
+
+# ── Hostname & hosts ───────────────────────────────────────────────────────
 - name: Set hostname
   hostname:
     name: "{{ inventory_hostname }}"
+  tags: [common, hostname]
 
 - name: Update /etc/hosts with cluster nodes
   lineinfile:
@@ -9,18 +21,32 @@
     line: "{{ hostvars[item].ansible_host }} {{ item }}"
     state: present
   loop: "{{ groups['k8s_cluster'] }}"
+  tags: [common, hostname]
 
+# ── Timezone ──────────────────────────────────────────────────────────────
 - name: Set timezone to Asia/Kolkata
-  timezone:
+  community.general.timezone:
     name: Asia/Kolkata
+  tags: [common, timezone]
 
-- name: Full system upgrade
+# ── SELinux (RedHat on-prem) ───────────────────────────────────────────────
+- name: Configure SELinux
+  ansible.posix.selinux:
+    policy: targeted
+    state: "{{ selinux_state }}"
+  when: ansible_os_family == "RedHat"
+  tags: [common, selinux]
+
+# ── Package update & base packages ────────────────────────────────────────
+- name: Full system upgrade (Debian)
   apt:
     upgrade: full
     update_cache: true
+    cache_valid_time: 3600
   when: ansible_os_family == "Debian"
+  tags: [common, packages]
 
-- name: Install prerequisite packages
+- name: Install prerequisite packages (Debian)
   apt:
     name:
       - apt-transport-https
@@ -37,8 +63,9 @@
       - open-iscsi
       - nfs-common
     state: present
-    update_cache: true
+    cache_valid_time: 3600
   when: ansible_os_family == "Debian"
+  tags: [common, packages]
 
 - name: Install prerequisite packages (RedHat)
   yum:
@@ -47,7 +74,7 @@
       - wget
       - ca-certificates
       - socat
-      - conntrack
+      - conntrack-tools        # package name differs from Debian's 'conntrack'
       - ipset
       - ipvsadm
       - chrony
@@ -55,32 +82,48 @@
       - nfs-utils
     state: present
   when: ansible_os_family == "RedHat"
+  tags: [common, packages]
 
-- name: Configure NTP with chrony
+# ── NTP ───────────────────────────────────────────────────────────────────
+- name: Configure chrony
   template:
     src: chrony.conf.j2
     dest: /etc/chrony.conf
     mode: "0644"
   notify: restart chrony
   when: configure_ntp
+  tags: [common, ntp]
 
-- name: Enable chrony
+- name: Enable chrony (service name is OS-specific)
   service:
-    name: chronyd
+    name: "{{ chrony_svc }}"
     state: started
     enabled: true
   when: configure_ntp
+  tags: [common, ntp]
 
+# ── iSCSI daemon ──────────────────────────────────────────────────────────
+- name: Enable and start iscsid
+  service:
+    name: iscsid
+    state: started
+    enabled: true
+  tags: [common, storage]
+
+# ── Swap ──────────────────────────────────────────────────────────────────
 - name: Disable swap (runtime)
   command: swapoff -a
   changed_when: false
+  tags: [common, swap]
 
 - name: Disable swap (persistent)
   replace:
     path: /etc/fstab
     regexp: '^ *([^#].* swap .*)$'
     replace: '# \1'
+  tags: [common, swap]
 
+# ── Kernel modules ────────────────────────────────────────────────────────
 - name: Write kernel modules config (persistent)
   copy:
     dest: /etc/modules-load.d/k8s.conf
@@ -90,9 +133,10 @@
       iscsi_tcp
       dm_crypt
     mode: "0644"
+  tags: [common, kernel]
 
 - name: Load kernel modules (runtime)
-  modprobe:
+  community.general.modprobe:
     name: "{{ item }}"
     state: present
   loop:
@@ -100,9 +144,11 @@
     - br_netfilter
     - iscsi_tcp
     - dm_crypt
+  tags: [common, kernel]
 
+# ── Sysctl ────────────────────────────────────────────────────────────────
 - name: Set required sysctl parameters
-  sysctl:
+  ansible.posix.sysctl:
     name: "{{ item.key }}"
     value: "{{ item.value }}"
     state: present
@@ -115,7 +161,9 @@
     - { key: net.ipv6.conf.all.forwarding,        value: "1" }
     - { key: kernel.unprivileged_bpf_disabled,    value: "0" }
     - { key: net.core.bpf_jit_enable,             value: "1" }
+  tags: [common, sysctl]
 
+# ── System limits ─────────────────────────────────────────────────────────
 - name: Write system limits for Kubernetes
   copy:
     dest: /etc/security/limits.d/99-kubernetes.conf
@@ -129,18 +177,41 @@
       *               hard    nproc           1048576
       root            soft    nproc           1048576
       root            hard    nproc           1048576
+  tags: [common, limits]
 
-- name: Mask multipathd (prevents iSCSI/Longhorn interference)
+# ── multipathd (must be masked before open-iscsi starts) ─────────────────
+- name: Mask multipathd to prevent iSCSI interference
   systemd:
     name: "{{ item }}"
     masked: true
+  loop:
+    - multipathd.service
+    - multipathd.socket
+  failed_when: false
+  tags: [common, storage]
+
+- name: Stop multipathd if running
+  systemd:
+    name: "{{ item }}"
     state: stopped
   loop:
     - multipathd.service
     - multipathd.socket
-  ignore_errors: true
+  failed_when: false
+  tags: [common, storage]
 
-# ── AWS-specific: kubelet provider-id via IMDSv2 ───────────────────────────
+# ── kubelet extra args ─────────────────────────────────────────────────────
+# AWS: resolved after IMDSv2 metadata tasks below
+# On-prem / non-AWS: written here using node_ip (overridable per-host)
+- name: Write kubelet extra args (on-prem / non-AWS)
+  copy:
+    dest: "{{ kubelet_env_file }}"
+    mode: "0644"
+    content: "KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}\n"
+  when: cloud_provider != "aws"
+  tags: [common]
+
+# ── AWS IMDSv2 — kubelet provider-id ─────────────────────────────────────
 - name: Fetch IMDSv2 token
   uri:
     url: http://169.254.169.254/latest/api/token
@@ -151,58 +222,63 @@
     timeout: 5
   register: imds_token
   when: cloud_provider == "aws"
-  ignore_errors: true
+  failed_when: false
+  tags: [common, aws]
 
-- name: Fetch AWS instance metadata
+- name: Fetch AWS instance-id
   uri:
-    url: "http://169.254.169.254/latest/meta-data/{{ item.key }}"
+    url: http://169.254.169.254/latest/meta-data/instance-id
     headers:
       X-aws-ec2-metadata-token: "{{ imds_token.content }}"
     return_content: true
     timeout: 5
-  register: aws_meta
-  loop:
-    - { key: instance-id,               name: instance_id }
-    - { key: local-ipv4,                name: private_ip }
-    - { key: placement/availability-zone, name: az }
-  when:
-    - cloud_provider == "aws"
-    - imds_token is not failed
-  ignore_errors: true
+  register: aws_instance_id_raw
+  when: cloud_provider == "aws" and imds_token is not failed
+  failed_when: false
+  tags: [common, aws]
 
-- name: Build AWS provider facts
-  set_fact:
-    aws_instance_id: "{{ aws_meta.results[0].content }}"
-    aws_private_ip:  "{{ aws_meta.results[1].content }}"
-    aws_az:          "{{ aws_meta.results[2].content }}"
-  when:
-    - cloud_provider == "aws"
-    - aws_meta is not failed
+- name: Fetch AWS private IP
+  uri:
+    url: http://169.254.169.254/latest/meta-data/local-ipv4
+    headers:
+      X-aws-ec2-metadata-token: "{{ imds_token.content }}"
+    return_content: true
+    timeout: 5
+  register: aws_private_ip_raw
+  when: cloud_provider == "aws" and imds_token is not failed
+  failed_when: false
+  tags: [common, aws]
+
+- name: Fetch AWS availability zone
+  uri:
+    url: http://169.254.169.254/latest/meta-data/placement/availability-zone
+    headers:
+      X-aws-ec2-metadata-token: "{{ imds_token.content }}"
+    return_content: true
+    timeout: 5
+  register: aws_az_raw
+  when: cloud_provider == "aws" and imds_token is not failed
+  failed_when: false
+  tags: [common, aws]
 
 - name: Write kubelet extra args (AWS)
   copy:
-    dest: /etc/default/kubelet
+    dest: "{{ kubelet_env_file }}"
     mode: "0644"
-    content: |
-      KUBELET_EXTRA_ARGS=--cloud-provider=external --provider-id=aws:///{{ aws_az }}/{{ aws_instance_id }} --node-ip={{ aws_private_ip }}
+    content: "KUBELET_EXTRA_ARGS=--cloud-provider=external --provider-id=aws:///{{ aws_az_raw.content }}/{{ aws_instance_id_raw.content }} --node-ip={{ aws_private_ip_raw.content }}\n"
   when:
     - cloud_provider == "aws"
-    - aws_instance_id is defined
-
-- name: Write kubelet extra args (on-prem / other cloud)
-  copy:
-    dest: /etc/default/kubelet
-    mode: "0644"
-    content: |
-      KUBELET_EXTRA_ARGS=--node-ip={{ ansible_default_ipv4.address }}
-  when: cloud_provider != "aws"
+    - aws_instance_id_raw is not failed
+    - aws_instance_id_raw.content is defined
+  tags: [common, aws]
 
 - name: Reload systemd daemon
   systemd:
     daemon_reload: true
+  tags: [common]
 
 # ── Firewall ──────────────────────────────────────────────────────────────
-- name: Disable firewalld (cloud uses SG rules)
+- name: Disable firewalld (cloud — SG handles rules)
   service:
     name: firewalld
     state: stopped
@@ -210,9 +286,10 @@
   when:
     - disable_host_firewall
     - ansible_os_family == "RedHat"
-  ignore_errors: true
+  failed_when: false
+  tags: [common, firewall]
 
-- name: Disable ufw (cloud uses SG rules)
+- name: Disable ufw (cloud — SG handles rules)
   service:
     name: ufw
     state: stopped
@@ -220,10 +297,12 @@
   when:
     - disable_host_firewall
     - ansible_os_family == "Debian"
-  ignore_errors: true
+  failed_when: false
+  tags: [common, firewall]
 
+# ── On-prem firewall: firewalld (RHEL) ────────────────────────────────────
 - name: Open required ports via firewalld (on-prem masters)
-  firewalld:
+  ansible.posix.firewalld:
     port: "{{ item }}"
     permanent: true
     state: enabled
@@ -241,10 +320,10 @@
     - not disable_host_firewall
     - ansible_os_family == "RedHat"
     - inventory_hostname in groups['masters']
-  ignore_errors: true
+  tags: [common, firewall]
 
 - name: Open required ports via firewalld (on-prem workers)
-  firewalld:
+  ansible.posix.firewalld:
     port: "{{ item }}"
     permanent: true
     state: enabled
@@ -259,4 +338,50 @@
     - not disable_host_firewall
     - ansible_os_family == "RedHat"
     - inventory_hostname in groups['workers']
-  ignore_errors: true
+  tags: [common, firewall]
+
+# ── On-prem firewall: ufw (Ubuntu/Debian) ─────────────────────────────────
+- name: Open required ports via ufw (on-prem masters)
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.port }}"
+    proto: "{{ item.proto }}"
+  loop:
+    - { port: "6443",       proto: tcp }
+    - { port: "2379:2380",  proto: tcp }
+    - { port: "10250",      proto: tcp }
+    - { port: "10259",      proto: tcp }
+    - { port: "10257",      proto: tcp }
+    - { port: "4240",       proto: tcp }
+    - { port: "8472",       proto: udp }
+    - { port: "51871",      proto: udp }
+  when:
+    - not disable_host_firewall
+    - ansible_os_family == "Debian"
+    - inventory_hostname in groups['masters']
+  tags: [common, firewall]
+
+- name: Open required ports via ufw (on-prem workers)
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.port }}"
+    proto: "{{ item.proto }}"
+  loop:
+    - { port: "10250",      proto: tcp }
+    - { port: "30000:32767", proto: tcp }
+    - { port: "4240",       proto: tcp }
+    - { port: "8472",       proto: udp }
+    - { port: "51871",      proto: udp }
+  when:
+    - not disable_host_firewall
+    - ansible_os_family == "Debian"
+    - inventory_hostname in groups['workers']
+  tags: [common, firewall]
+
+- name: Enable ufw (on-prem Debian)
+  community.general.ufw:
+    state: enabled
+  when:
+    - not disable_host_firewall
+    - ansible_os_family == "Debian"
+  tags: [common, firewall]

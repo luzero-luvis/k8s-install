@@ -6,14 +6,18 @@
     state: directory
     mode: "0755"
   when: ansible_os_family == "Debian"
+  tags: [kubernetes, packages]
 
 - name: Download Kubernetes apt GPG key
   shell: |
+    set -o pipefail
     curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key \
       | gpg --dearmor -o {{ kubernetes_apt_keyring_path }}
   args:
+    executable: /bin/bash
     creates: "{{ kubernetes_apt_keyring_path }}"
   when: ansible_os_family == "Debian"
+  tags: [kubernetes, packages]
 
 - name: Add Kubernetes apt repository
   apt_repository:
@@ -21,19 +25,22 @@
     state: present
     filename: kubernetes
   when: ansible_os_family == "Debian"
+  tags: [kubernetes, packages]
 
 - name: Install kubeadm, kubelet, kubectl (Debian)
   apt:
     name:
-      - "kubelet"
-      - "kubeadm"
-      - "kubectl"
+      - kubelet
+      - kubeadm
+      - kubectl
     state: present
     update_cache: true
+    cache_valid_time: 3600
   when: ansible_os_family == "Debian"
+  tags: [kubernetes, packages]
 
-- name: Hold kubeadm, kubelet, kubectl at current version (Debian)
-  dpkg_selections:
+- name: Hold kubeadm, kubelet, kubectl at current version
+  community.general.dpkg_selections:
     name: "{{ item }}"
     selection: hold
   loop:
@@ -41,6 +48,7 @@
     - kubeadm
     - kubectl
   when: ansible_os_family == "Debian"
+  tags: [kubernetes, packages]
 
 # ── RedHat / CentOS / Fedora ────────────────────────────────────────────────
 - name: Add Kubernetes yum repository
@@ -53,6 +61,7 @@
     enabled: true
     exclude: "kubelet kubeadm kubectl cri-tools kubernetes-cni"
   when: ansible_os_family == "RedHat"
+  tags: [kubernetes, packages]
 
 - name: Install kubeadm, kubelet, kubectl (RedHat)
   yum:
@@ -63,6 +72,7 @@
     state: present
     disable_excludes: kubernetes
   when: ansible_os_family == "RedHat"
+  tags: [kubernetes, packages]
 
 # ── Common ──────────────────────────────────────────────────────────────────
 - name: Enable and start kubelet
@@ -70,3 +80,4 @@
     name: kubelet
     state: started
     enabled: true
+  tags: [kubernetes]

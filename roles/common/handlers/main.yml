@@ -1,5 +1,5 @@
 ---
 - name: restart chrony
   service:
-    name: chronyd
+    name: "{{ chrony_svc }}"   # 'chrony' on Debian, 'chronyd' on RedHat
     state: restarted

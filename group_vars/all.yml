@@ -11,6 +11,18 @@ kubernetes_apt_keyring_path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 containerd_config_dir: /etc/containerd
 
 # ──────────────────────────────────────────────
+# Helm
+# ──────────────────────────────────────────────
+helm_version: "3.17.3"
+
+# ──────────────────────────────────────────────
+# Architecture mapping (ansible_architecture → apt/docker arch)
+# ──────────────────────────────────────────────
+arch_map:
+  x86_64: amd64
+  aarch64: arm64
+
+# ──────────────────────────────────────────────
 # Pod & Service networking — Cilium
 # ──────────────────────────────────────────────
 pod_network_cidr: "10.0.0.0/8"
@@ -36,15 +48,28 @@ kubeadm_token_ttl: "24h"
 # ──────────────────────────────────────────────
 # Environment-specific toggles
 # ──────────────────────────────────────────────
-# Cloud provider: aws | gcp | azure | onprem
-# Used to conditionally configure kubelet provider-id and IMDSv2 metadata.
+# Cloud provider: aws | onprem
+# Controls kubelet provider-id, IMDSv2 metadata fetch.
 cloud_provider: onprem
 
-# true on cloud where SG/firewall rules are managed externally
+# true on cloud where SG/firewall rules are managed externally.
+# false on on-prem — roles will open ports via firewalld (RHEL) or ufw (Debian).
 disable_host_firewall: false
+
+# Override the IP advertised to Kubernetes if a node has multiple NICs.
+# Defaults to the primary IPv4 address detected by Ansible.
+# Set per-host in inventory: node_ip=192.168.10.5
+node_ip: "{{ ansible_default_ipv4.address }}"
 
 # On-prem usually needs NTP; cloud VMs typically have it
 configure_ntp: true
 ntp_servers:
   - "0.pool.ntp.org"
   - "1.pool.ntp.org"
+
+# ──────────────────────────────────────────────
+# SELinux (RedHat on-prem only)
+# permissive: logs violations but does not block (recommended for k8s)
+# enforcing: fully enforced — requires additional policy tuning
+# ──────────────────────────────────────────────
+selinux_state: permissive

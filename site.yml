@@ -1,13 +1,22 @@
 ---
 # Kubernetes cluster installation — master + workers with Cilium CNI
+#
 # Usage:
 #   Cloud:   ansible-playbook -i inventory/cloud.ini site.yml
 #   On-prem: ansible-playbook -i inventory/onprem.ini site.yml
+#
+# Run a single role:
+#   ansible-playbook -i inventory/cloud.ini site.yml --tags containerd
+#   ansible-playbook -i inventory/cloud.ini site.yml --tags cilium
+#
+# Install collections first:
+#   ansible-galaxy collection install -r requirements.yml
 
 - name: Common OS preparation (all nodes)
   hosts: k8s_cluster
   become: true
   gather_facts: true
+  tags: [common]
   roles:
     - common
     - containerd
@@ -17,6 +26,7 @@
   hosts: masters
   become: true
   gather_facts: true
+  tags: [master, cilium, helm]
   roles:
     - master
 
@@ -24,5 +34,6 @@
   hosts: workers
   become: true
   gather_facts: true
+  tags: [worker]
   roles:
     - worker

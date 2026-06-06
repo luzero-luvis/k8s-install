@@ -1,0 +1,34 @@
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: "{{ _apiserver_ip }}"
+  bindPort: 6443
+nodeRegistration:
+  criSocket: unix:///var/run/containerd/containerd.sock
+  imagePullPolicy: IfNotPresent
+{% if cloud_provider == 'aws' %}
+  kubeletExtraArgs:
+    cloud-provider: external
+{% endif %}
+skipPhases:
+  - addon/kube-proxy
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: "v{{ kubernetes_version }}"
+clusterName: kubernetes
+networking:
+  dnsDomain: cluster.local
+  podSubnet: "{{ pod_network_cidr }}"
+  serviceSubnet: "{{ service_cidr }}"
+{% if apiserver_extra_sans | length > 0 %}
+apiServer:
+  certSANs:
+{% for san in apiserver_extra_sans %}
+    - "{{ san }}"
+{% endfor %}
+{% endif %}
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd

@@ -1,58 +1,81 @@
 ---
-- name: Add Docker GPG key (containerd repo)
+# ── Add Docker repo (containerd source) — Debian/Ubuntu ────────────────────
+# ansible_distribution gives 'Ubuntu' or 'Debian'; lower-case matches the repo path.
+- name: Download Docker GPG key (Debian family)
   shell: |
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    set -o pipefail
+    curl -fsSL https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg \
       | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
   args:
+    executable: /bin/bash
     creates: /usr/share/keyrings/docker-archive-keyring.gpg
   when: ansible_os_family == "Debian"
+  tags: [containerd, packages]
 
-- name: Add Docker apt repository (containerd)
+- name: Add Docker apt repository (Debian family)
   apt_repository:
-    repo: "deb [arch={{ ansible_architecture }} signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    repo: "deb [arch={{ deb_arch }} signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/{{ ansible_distribution | lower }} {{ ansible_distribution_release }} stable"
     state: present
     filename: docker
   when: ansible_os_family == "Debian"
+  tags: [containerd, packages]
 
-- name: Add Docker yum repository (containerd)
+# ── Add Docker repo — RedHat family ────────────────────────────────────────
+# RHEL 9 uses the 'rhel' repo path; Rocky/AlmaLinux/CentOS use 'centos'.
+- name: Set Docker yum repo base URL fact
+  set_fact:
+    _docker_yum_baseurl: "https://download.docker.com/linux/{{ 'rhel' if ansible_distribution == 'RedHat' else 'centos' }}/$releasever/$basearch/stable"
+  when: ansible_os_family == "RedHat"
+  tags: [containerd, packages]
+
+- name: Add Docker yum repository (RedHat family)
   yum_repository:
     name: docker-ce
     description: Docker CE Stable
-    baseurl: https://download.docker.com/linux/centos/$releasever/$basearch/stable
+    baseurl: "{{ _docker_yum_baseurl }}"
     gpgcheck: true
-    gpgkey: https://download.docker.com/linux/centos/gpg
+    gpgkey: "https://download.docker.com/linux/{{ 'rhel' if ansible_distribution == 'RedHat' else 'centos' }}/gpg"
     enabled: true
   when: ansible_os_family == "RedHat"
+  tags: [containerd, packages]
 
-- name: Install containerd.io
+# ── Install containerd ─────────────────────────────────────────────────────
+- name: Install containerd.io (Debian)
   apt:
     name: containerd.io
     state: present
     update_cache: true
+    cache_valid_time: 3600
   when: ansible_os_family == "Debian"
+  tags: [containerd, packages]
 
 - name: Install containerd.io (RedHat)
   yum:
     name: containerd.io
     state: present
   when: ansible_os_family == "RedHat"
+  tags: [containerd, packages]
 
+# ── Configure containerd ───────────────────────────────────────────────────
 - name: Create containerd config directory
   file:
     path: "{{ containerd_config_dir }}"
     state: directory
     mode: "0755"
+  tags: [containerd, config]
 
 - name: Create containerd certs.d directory
   file:
     path: "{{ containerd_config_dir }}/certs.d"
     state: directory
     mode: "0755"
+  tags: [containerd, config]
 
 - name: Generate default containerd config
   command: containerd config default
   register: containerd_default_config
   changed_when: false
+  tags: [containerd, config]
 
 - name: Write containerd config
   copy:
@@ -60,30 +83,36 @@
     dest: "{{ containerd_config_dir }}/config.toml"
     mode: "0644"
   notify: restart containerd
+  tags: [containerd, config]
 
-- name: Enable SystemdCgroup in containerd config
+- name: Enable SystemdCgroup
   replace:
     path: "{{ containerd_config_dir }}/config.toml"
-    regexp: 'SystemdCgroup = false'
+    regexp: 'SystemdCgroup\s*=\s*false'
     replace: 'SystemdCgroup = true'
   notify: restart containerd
+  tags: [containerd, config]
 
-- name: Set sandbox_image to pause:3.10
+- name: Set pause image to 3.10
   replace:
     path: "{{ containerd_config_dir }}/config.toml"
     regexp: '^\s*sandbox_image\s*=\s*".*"'
     replace: '    sandbox_image = "registry.k8s.io/pause:3.10"'
   notify: restart containerd
+  tags: [containerd, config]
 
-- name: Set config_path for containerd registry certs
+- name: Set config_path for registry certs
   replace:
     path: "{{ containerd_config_dir }}/config.toml"
     regexp: '^\s*config_path\s*=\s*""'
     replace: '      config_path = "/etc/containerd/certs.d"'
   notify: restart containerd
+  tags: [containerd, config]
 
+# ── Enable containerd ──────────────────────────────────────────────────────
 - name: Enable and start containerd
   service:
     name: containerd
     state: started
     enabled: true
+  tags: [containerd]
