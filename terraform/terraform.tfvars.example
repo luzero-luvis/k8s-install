@@ -1,0 +1,27 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# terraform.tfvars is gitignored — safe to add real values.
+
+aws_region   = "ap-south-1"   # Change to your region
+cluster_name = "k8s-test"
+
+worker_count         = 2
+master_instance_type = "t3.medium"   # 2 vCPU, 4 GB — minimum for master
+worker_instance_type = "t3.medium"
+disk_size_gb         = 30
+
+# ── SSH key — pick Mode A or Mode B ──────────────────────────────────────
+
+# Mode A: upload your local public key (Terraform creates a new AWS key pair)
+existing_key_pair_name = ""
+ssh_public_key_path    = "~/.ssh/id_rsa.pub"
+ssh_private_key_path   = "~/.ssh/id_rsa"
+
+# Mode B: use a key pair that already exists in AWS
+# existing_key_pair_name = "my-existing-key"   # name shown in EC2 → Key Pairs
+# ssh_public_key_path    = ""                  # not used in Mode B
+# ssh_private_key_path   = "~/.ssh/id_rsa"     # private key you already have locally
+
+# ── Security ──────────────────────────────────────────────────────────────
+# Restrict to your own IP for security — curl ifconfig.me to find it
+allowed_ssh_cidr = "0.0.0.0/0"   # e.g. "1.2.3.4/32"
+allowed_api_cidr = "0.0.0.0/0"   # e.g. "1.2.3.4/32"

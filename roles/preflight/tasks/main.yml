@@ -76,7 +76,7 @@
   uri:
     url: https://get.helm.sh
     timeout: 10
-    status_code: [200, 301, 302]
+    status_code: [200, 301, 302, 404]   # CDN root returns 404 — file downloads still work
   tags: [preflight]
 
 # ── Unique hostnames ──────────────────────────────────────────────────────

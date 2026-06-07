@@ -2,7 +2,8 @@
 # ──────────────────────────────────────────────
 # Kubernetes version
 # ──────────────────────────────────────────────
-kubernetes_version: "1.36"
+kubernetes_version: "1.36.1"
+kubernetes_repo_version: "{{ kubernetes_version.split('.')[:2] | join('.') }}"
 kubernetes_apt_keyring_path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 
 # ──────────────────────────────────────────────
@@ -25,7 +26,9 @@ arch_map:
 # ──────────────────────────────────────────────
 # Pod & Service networking — Cilium
 # ──────────────────────────────────────────────
-pod_network_cidr: "10.0.0.0/8"
+# IMPORTANT: must not overlap with your host network or VPC CIDR.
+# 10.244.0.0/16 is the standard k8s default — change if your LAN uses that range.
+pod_network_cidr: "10.244.0.0/16"
 service_cidr: "10.96.0.0/12"
 
 cilium_version: "1.19.4"
@@ -52,9 +55,12 @@ kubeadm_token_ttl: "24h"
 # Controls kubelet provider-id, IMDSv2 metadata fetch.
 cloud_provider: onprem
 
-# true on cloud where SG/firewall rules are managed externally.
-# false on on-prem — roles will open ports via firewalld (RHEL) or ufw (Debian).
-disable_host_firewall: false
+# true  — Ansible does not touch the firewall (default).
+#         Use this when firewall rules are managed externally (cloud SGs, on-prem
+#         corporate firewall, or no firewall at all).
+# false — Ansible opens required K8s ports via firewalld (RHEL) or ufw (Debian).
+#         Only enable this if you want Ansible to manage host-level firewall rules.
+disable_host_firewall: true
 
 # Override the IP advertised to Kubernetes if a node has multiple NICs.
 # Defaults to the primary IPv4 address detected by Ansible.

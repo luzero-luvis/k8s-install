@@ -7,7 +7,7 @@
 
 - name: Detect primary IP if apiserver_advertise_address not set
   set_fact:
-    _apiserver_ip: "{{ apiserver_advertise_address if apiserver_advertise_address else ansible_default_ipv4.address }}"
+    _apiserver_ip: "{{ apiserver_advertise_address if apiserver_advertise_address else ansible_facts['default_ipv4']['address'] }}"
   tags: [master, always]
 
 # ── kubeadm init via config file (reproducible, diffable) ─────────────────

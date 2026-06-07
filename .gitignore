@@ -27,12 +27,15 @@ id_ed25519
 id_ecdsa
 *.ppk
 
-# ── Terraform (if used alongside) ─────────────────────────────────────────
+# ── Terraform ──────────────────────────────────────────────────────────────
 *.tfstate
 *.tfstate.backup
+# tfvars contain real IPs/CIDRs/key paths — only *.tfvars.example is safe to commit
 *.tfvars
+!*.tfvars.example
+# .terraform/ holds downloaded provider binaries — never commit
 .terraform/
-.terraform.lock.hcl
+# .terraform.lock.hcl locks provider versions — should be committed, NOT ignored
 
 # ── OS / editor ───────────────────────────────────────────────────────────
 .DS_Store

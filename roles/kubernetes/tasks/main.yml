@@ -11,7 +11,7 @@
 - name: Download Kubernetes apt GPG key
   shell: |
     set -o pipefail
-    curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key \
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_repo_version }}/deb/Release.key \
       | gpg --dearmor -o {{ kubernetes_apt_keyring_path }}
   args:
     executable: /bin/bash
@@ -21,7 +21,7 @@
 
 - name: Add Kubernetes apt repository
   apt_repository:
-    repo: "deb [signed-by={{ kubernetes_apt_keyring_path }}] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /"
+    repo: "deb [signed-by={{ kubernetes_apt_keyring_path }}] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_repo_version }}/deb/ /"
     state: present
     filename: kubernetes
   when: ansible_os_family == "Debian"
@@ -40,7 +40,7 @@
   tags: [kubernetes, packages]
 
 - name: Hold kubeadm, kubelet, kubectl at current version
-  community.general.dpkg_selections:
+  ansible.builtin.dpkg_selections:
     name: "{{ item }}"
     selection: hold
   loop:
@@ -55,9 +55,9 @@
   yum_repository:
     name: kubernetes
     description: "Kubernetes v{{ kubernetes_version }}"
-    baseurl: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/rpm/"
+    baseurl: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_repo_version }}/rpm/"
     gpgcheck: true
-    gpgkey: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/rpm/repodata/repomd.xml.key"
+    gpgkey: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_repo_version }}/rpm/repodata/repomd.xml.key"
     enabled: true
     exclude: "kubelet kubeadm kubectl cri-tools kubernetes-cni"
   when: ansible_os_family == "RedHat"

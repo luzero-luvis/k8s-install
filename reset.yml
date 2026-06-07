@@ -13,6 +13,11 @@
       failed_when: false
       changed_when: false
 
+    - name: Wait for node to stabilise after kubeadm reset
+      wait_for_connection:
+        timeout: 60
+        sleep: 5
+
     - name: Remove CNI config
       file:
         path: /etc/cni
@@ -48,27 +53,46 @@
         KUBECONFIG: /etc/kubernetes/admin.conf
       when: inventory_hostname in groups['masters']
 
-    - name: Flush iptables rules
-      command: "{{ item }}"
-      loop:
-        - iptables -F
-        - iptables -X
-        - iptables -t nat -F
-        - iptables -t nat -X
-        - iptables -t mangle -F
-        - iptables -t mangle -X
+    - name: Remove Cilium virtual interfaces and stale routes
+      shell: |
+        # Delete Cilium virtual interfaces — these inject routes that can
+        # hijack traffic to the real host subnet if pod CIDR overlaps with VPC.
+        for iface in cilium_host cilium_net cilium_vxlan cilium_geneve lxc_health; do
+          ip link del "$iface" 2>/dev/null || true
+        done
+        # Remove any lxc* interfaces left by Cilium endpoint management
+        for iface in $(ip -o link show | awk -F': ' '{print $2}' | grep '^lxc'); do
+          ip link del "$iface" 2>/dev/null || true
+        done
+        # Flush routes added by Cilium (anything via cilium_host is now gone)
+        ip route flush proto kernel 2>/dev/null || true
+      args:
+        executable: /bin/bash
       failed_when: false
       changed_when: false
 
-    - name: Flush ip6tables rules
-      command: "{{ item }}"
-      loop:
-        - ip6tables -F
-        - ip6tables -X
-        - ip6tables -t nat -F
-        - ip6tables -t nat -X
-        - ip6tables -t mangle -F
-        - ip6tables -t mangle -X
+    - name: Flush iptables and ip6tables rules
+      shell: |
+        iptables -P INPUT ACCEPT
+        iptables -P FORWARD ACCEPT
+        iptables -P OUTPUT ACCEPT
+        iptables -F
+        iptables -X
+        iptables -t nat -F
+        iptables -t nat -X
+        iptables -t mangle -F
+        iptables -t mangle -X
+        ip6tables -P INPUT ACCEPT
+        ip6tables -P FORWARD ACCEPT
+        ip6tables -P OUTPUT ACCEPT
+        ip6tables -F
+        ip6tables -X
+        ip6tables -t nat -F
+        ip6tables -t nat -X
+        ip6tables -t mangle -F
+        ip6tables -t mangle -X
+      args:
+        executable: /bin/bash
       failed_when: false
       changed_when: false
 
