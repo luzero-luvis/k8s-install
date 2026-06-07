@@ -10,7 +10,8 @@
   tasks:
     - name: Run kubeadm reset
       command: kubeadm reset -f
-      ignore_errors: true
+      failed_when: false
+      changed_when: false
 
     - name: Remove CNI config
       file:
@@ -25,12 +26,29 @@
         - /root/.kube
         - "/home/{{ ansible_user }}/.kube"
 
-    - name: Remove Cilium Helm release artifacts (master only)
-      command: helm uninstall cilium -n kube-system
+    - name: Remove Kubernetes apt repo and keyring (Debian)
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/kubernetes.list
+        - /etc/apt/keyrings/kubernetes-apt-keyring.gpg
       ignore_errors: true
+
+    - name: Remove kubeadm init config
+      file:
+        path: /etc/kubernetes/kubeadm-init.yaml
+        state: absent
+
+    - name: Remove Cilium Helm release (master only)
+      command: helm uninstall cilium -n kube-system
+      failed_when: false
+      changed_when: false
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
       when: inventory_hostname in groups['masters']
 
-    - name: Flush iptables
+    - name: Flush iptables rules
       command: "{{ item }}"
       loop:
         - iptables -F
@@ -39,9 +57,31 @@
         - iptables -t nat -X
         - iptables -t mangle -F
         - iptables -t mangle -X
-      ignore_errors: true
+      failed_when: false
+      changed_when: false
+
+    - name: Flush ip6tables rules
+      command: "{{ item }}"
+      loop:
+        - ip6tables -F
+        - ip6tables -X
+        - ip6tables -t nat -F
+        - ip6tables -t nat -X
+        - ip6tables -t mangle -F
+        - ip6tables -t mangle -X
+      failed_when: false
+      changed_when: false
 
     - name: Restart containerd
       service:
         name: containerd
         state: restarted
+
+- name: Remove fetched kubeconfig from control machine
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Remove local kubeconfig
+      file:
+        path: "{{ playbook_dir }}/kubeconfig"
+        state: absent

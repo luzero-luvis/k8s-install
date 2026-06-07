@@ -5,12 +5,22 @@
 #   Cloud:   ansible-playbook -i inventory/cloud.ini site.yml
 #   On-prem: ansible-playbook -i inventory/onprem.ini site.yml
 #
-# Run a single role:
-#   ansible-playbook -i inventory/cloud.ini site.yml --tags containerd
-#   ansible-playbook -i inventory/cloud.ini site.yml --tags cilium
+# Partial runs (tags):
+#   --tags preflight     Run pre-flight checks only
+#   --tags containerd    Re-configure containerd only
+#   --tags cilium        Re-install Cilium only
+#   --tags verify        Run post-install health checks only
 #
-# Install collections first:
+# Prerequisites:
 #   ansible-galaxy collection install -r requirements.yml
+
+- name: Pre-flight checks (all nodes)
+  hosts: k8s_cluster
+  become: true
+  gather_facts: true
+  tags: [preflight]
+  roles:
+    - preflight
 
 - name: Common OS preparation (all nodes)
   hosts: k8s_cluster
@@ -37,3 +47,66 @@
   tags: [worker]
   roles:
     - worker
+
+- name: Post-install verification
+  hosts: masters
+  become: true
+  gather_facts: false
+  tags: [verify, post-install]
+  tasks:
+    - name: Wait for all nodes to be Ready
+      command: kubectl get nodes --no-headers
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: nodes_status
+      until: >
+        nodes_status.stdout_lines | length == groups['k8s_cluster'] | length
+        and nodes_status.stdout_lines | select('search', 'NotReady') | list | length == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+      tags: [verify]
+
+    - name: Wait for Cilium pods to be Running
+      command: >
+        kubectl get pods -n kube-system -l k8s-app=cilium
+        --field-selector=status.phase=Running --no-headers
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: cilium_pods
+      until: cilium_pods.stdout_lines | length >= 1
+      retries: 24
+      delay: 15
+      changed_when: false
+      tags: [verify, cilium]
+
+    - name: Wait for CoreDNS pods to be Running
+      command: >
+        kubectl get pods -n kube-system -l k8s-app=kube-dns
+        --field-selector=status.phase=Running --no-headers
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: coredns_pods
+      until: coredns_pods.stdout_lines | length >= 2
+      retries: 20
+      delay: 15
+      changed_when: false
+      tags: [verify]
+
+    - name: Show final cluster state
+      command: kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: cluster_nodes
+      changed_when: false
+      tags: [verify]
+
+    - name: Print cluster summary
+      debug:
+        msg: "{{ cluster_nodes.stdout_lines }}"
+      tags: [verify]
+
+    - name: Print kubeconfig location
+      debug:
+        msg: "Kubeconfig saved to: {{ playbook_dir }}/kubeconfig — run: export KUBECONFIG={{ playbook_dir }}/kubeconfig"
+      tags: [verify]

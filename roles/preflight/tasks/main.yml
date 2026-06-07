@@ -1,0 +1,117 @@
+---
+# ── OS ────────────────────────────────────────────────────────────────────
+- name: Verify supported OS
+  fail:
+    msg: >
+      Unsupported OS: {{ ansible_distribution }} {{ ansible_distribution_version }}.
+      Supported: Ubuntu 22/24, Debian 12, RHEL/Rocky/AlmaLinux 9.
+  when: >
+    not (
+      (ansible_distribution == "Ubuntu" and ansible_distribution_major_version in ["22","24"]) or
+      (ansible_distribution == "Debian" and ansible_distribution_major_version == "12") or
+      (ansible_os_family == "RedHat" and ansible_distribution_major_version == "9")
+    )
+  tags: [preflight]
+
+# ── Kernel ────────────────────────────────────────────────────────────────
+- name: Verify kernel >= 5.10 (required for Cilium eBPF)
+  fail:
+    msg: >
+      Kernel {{ ansible_kernel }} on {{ inventory_hostname }} is too old.
+      Cilium eBPF requires >= 5.10. Run: apt-get install --install-recommends linux-generic-hwe-22.04
+  when: ansible_kernel is version('5.10', '<')
+  tags: [preflight]
+
+# ── CPU ───────────────────────────────────────────────────────────────────
+- name: Verify CPU count >= 2
+  fail:
+    msg: "{{ inventory_hostname }} has {{ ansible_processor_vcpus }} vCPU. Kubernetes requires >= 2."
+  when: ansible_processor_vcpus < 2
+  tags: [preflight]
+
+# ── Memory ────────────────────────────────────────────────────────────────
+- name: Verify memory — master >= 2 GB, worker >= 1.5 GB
+  fail:
+    msg: >
+      {{ inventory_hostname }} has {{ ansible_memtotal_mb }}MB RAM.
+      Required: {{ 2048 if inventory_hostname in groups['masters'] else 1536 }}MB.
+  when: >
+    (inventory_hostname in groups['masters'] and ansible_memtotal_mb < 2048) or
+    (inventory_hostname in groups['workers']  and ansible_memtotal_mb < 1536)
+  tags: [preflight]
+
+# ── Disk ──────────────────────────────────────────────────────────────────
+- name: Verify disk space on / >= 20 GB
+  fail:
+    msg: >
+      {{ inventory_hostname }} has {{ (item.size_available / 1073741824) | round(1) }}GB
+      free on /. Need >= 20GB.
+  when: item.mount == '/' and item.size_available < 21474836480
+  loop: "{{ ansible_mounts }}"
+  tags: [preflight]
+
+# ── Internet connectivity ──────────────────────────────────────────────────
+- name: Verify connectivity to pkgs.k8s.io
+  uri:
+    url: https://pkgs.k8s.io
+    timeout: 10
+    status_code: [200, 301, 302]
+  tags: [preflight]
+
+- name: Verify connectivity to download.docker.com
+  uri:
+    url: https://download.docker.com
+    timeout: 10
+    status_code: [200, 301, 302]
+  tags: [preflight]
+
+- name: Verify connectivity to quay.io (Cilium images)
+  uri:
+    url: https://quay.io
+    timeout: 10
+    status_code: [200, 301, 302]
+  tags: [preflight]
+
+- name: Verify connectivity to get.helm.sh
+  uri:
+    url: https://get.helm.sh
+    timeout: 10
+    status_code: [200, 301, 302]
+  tags: [preflight]
+
+# ── Unique hostnames ──────────────────────────────────────────────────────
+- name: Collect hostnames across cluster
+  set_fact:
+    all_hostnames: "{{ groups['k8s_cluster'] | map('extract', hostvars, 'inventory_hostname') | list }}"
+  tags: [preflight]
+
+- name: Verify all node hostnames are unique
+  fail:
+    msg: "Duplicate hostnames detected in inventory: {{ all_hostnames }}"
+  when: all_hostnames | length != all_hostnames | unique | length
+  tags: [preflight]
+
+# ── Unique IPs ────────────────────────────────────────────────────────────
+- name: Collect node IPs across cluster
+  set_fact:
+    all_ips: "{{ groups['k8s_cluster'] | map('extract', hostvars, 'ansible_host') | list }}"
+  tags: [preflight]
+
+- name: Verify all node IPs are unique
+  fail:
+    msg: "Duplicate ansible_host IPs detected: {{ all_ips }}"
+  when: all_ips | length != all_ips | unique | length
+  run_once: true
+  tags: [preflight]
+
+# ── Summary ───────────────────────────────────────────────────────────────
+- name: Print pre-flight summary
+  debug:
+    msg:
+      - "Host   : {{ inventory_hostname }}"
+      - "OS     : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+      - "Kernel : {{ ansible_kernel }}"
+      - "CPU    : {{ ansible_processor_vcpus }} vCPU"
+      - "Memory : {{ ansible_memtotal_mb }} MB"
+      - "Disk / : {{ (ansible_mounts | selectattr('mount', 'equalto', '/') | list | first).size_available | filesizeformat }} free"
+  tags: [preflight]

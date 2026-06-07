@@ -70,10 +70,11 @@
   failed_when: false
   tags: [master, helm]
 
-- name: Download Helm tarball
+- name: Download Helm tarball (with SHA256 checksum verification)
   get_url:
     url: "https://get.helm.sh/helm-v{{ helm_version }}-linux-{{ deb_arch }}.tar.gz"
     dest: "/tmp/helm-v{{ helm_version }}.tar.gz"
+    checksum: "sha256:https://get.helm.sh/helm-v{{ helm_version }}-linux-{{ deb_arch }}.tar.gz.sha256sum"
     mode: "0644"
   when: helm_installed.rc != 0
   tags: [master, helm]
@@ -140,13 +141,24 @@
   tags: [master]
 
 # ── Generate join command for workers ─────────────────────────────────────
+# Always generate a fresh token so workers can join even on re-runs.
+# Tokens are short-lived (kubeadm_token_ttl) and safe to recreate.
 - name: Generate kubeadm join command
   command: kubeadm token create --print-join-command --ttl {{ kubeadm_token_ttl }}
   register: join_command_raw
-  changed_when: true
+  changed_when: false
   tags: [master]
 
 - name: Store join command as host fact
   set_fact:
     kubeadm_join_command: "{{ join_command_raw.stdout }}"
   tags: [master, always]
+
+# ── Fetch kubeconfig to control machine ──────────────────────────────────
+- name: Fetch kubeconfig to control machine
+  fetch:
+    src: /etc/kubernetes/admin.conf
+    dest: "{{ playbook_dir }}/kubeconfig"
+    flat: true
+    mode: "0600"
+  tags: [master, kubeconfig]

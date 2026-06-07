@@ -52,6 +52,9 @@ __pycache__/
 venv/
 .env
 
+# ── Kubeconfig (fetched from master by site.yml) ──────────────────────────
+kubeconfig
+
 # ── Logs & temp ───────────────────────────────────────────────────────────
 *.log
 /tmp/

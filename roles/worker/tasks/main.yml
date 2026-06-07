@@ -1,4 +1,14 @@
 ---
+# ── Guard ─────────────────────────────────────────────────────────────────
+- name: Verify join command is available from master
+  fail:
+    msg: >
+      kubeadm_join_command is not defined on {{ groups['masters'][0] }}.
+      Make sure the master play completed successfully before running the worker play.
+  when: hostvars[groups['masters'][0]].kubeadm_join_command is not defined
+  tags: [worker]
+
+# ── Join ──────────────────────────────────────────────────────────────────
 - name: Check if node is already joined
   stat:
     path: /etc/kubernetes/kubelet.conf
@@ -16,4 +26,16 @@
     name: kubelet
     state: started
     enabled: true
+  tags: [worker]
+
+# ── Label node ────────────────────────────────────────────────────────────
+- name: Label node as worker
+  command: >
+    kubectl label node {{ inventory_hostname }}
+    node-role.kubernetes.io/worker=worker
+    --overwrite
+  delegate_to: "{{ groups['masters'][0] }}"
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: true
   tags: [worker]

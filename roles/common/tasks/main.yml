@@ -341,6 +341,17 @@
   tags: [common, firewall]
 
 # ── On-prem firewall: ufw (Ubuntu/Debian) ─────────────────────────────────
+# SSH must be allowed BEFORE ufw is enabled to prevent control-machine lockout.
+- name: Allow SSH via ufw (prevent lockout)
+  community.general.ufw:
+    rule: allow
+    port: "22"
+    proto: tcp
+  when:
+    - not disable_host_firewall
+    - ansible_os_family == "Debian"
+  tags: [common, firewall]
+
 - name: Open required ports via ufw (on-prem masters)
   community.general.ufw:
     rule: allow
@@ -378,7 +389,16 @@
     - inventory_hostname in groups['workers']
   tags: [common, firewall]
 
-- name: Enable ufw (on-prem Debian)
+- name: Set ufw default incoming policy to deny
+  community.general.ufw:
+    default: deny
+    direction: incoming
+  when:
+    - not disable_host_firewall
+    - ansible_os_family == "Debian"
+  tags: [common, firewall]
+
+- name: Enable ufw
   community.general.ufw:
     state: enabled
   when:
