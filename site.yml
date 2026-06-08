@@ -1,112 +1,171 @@
 ---
-# Kubernetes cluster installation — master + workers with Cilium CNI
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE: site.yml
+# PURPOSE: THE MASTER PLAYBOOK — the main instruction booklet.
+# Running this single file installs a complete Kubernetes cluster from scratch.
+# It runs tasks in ORDER — each "play" (section) runs after the previous one finishes.
 #
-# Usage:
-#   Cloud:   ansible-playbook -i inventory/cloud.ini site.yml
+# HOW TO RUN:
 #   On-prem: ansible-playbook -i inventory/onprem.ini site.yml
+#   Cloud:   ansible-playbook -i inventory/cloud.ini site.yml
 #
-# Partial runs (tags):
-#   --tags preflight     Run pre-flight checks only
+# HOW TO RUN ONLY PART OF IT (using tags):
+#   --tags preflight     Run pre-flight checks only (no installation)
 #   --tags containerd    Re-configure containerd only
-#   --tags cilium        Re-install Cilium only
+#   --tags cilium        Re-install Cilium networking only
 #   --tags verify        Run post-install health checks only
 #
-# Prerequisites:
+# BEFORE FIRST RUN — download extra Ansible tools:
 #   ansible-galaxy collection install -r requirements.yml
+# ─────────────────────────────────────────────────────────────────────────────
 
-- name: Pre-flight checks (all nodes)
-  hosts: k8s_cluster
-  become: true
-  gather_facts: true
-  tags: [preflight]
+# ═════════════════════════════════════════════════════════════════════════════
+# PLAY 1 — Pre-flight checks
+# PURPOSE: Before installing ANYTHING, make sure every computer is ready.
+# If any check fails, the whole playbook stops. Fix the problem, then re-run.
+# ═════════════════════════════════════════════════════════════════════════════
+- name: Pre-flight checks (all nodes)   # Label shown in terminal when this runs
+  hosts: k8s_cluster                    # Run this on ALL computers (masters + workers)
+  become: true                          # Use sudo — run every task as root/admin
+  gather_facts: true                    # First collect system info (OS, RAM, CPU, IP) from each computer
+  tags: [preflight]                     # Label this section "preflight" so you can run it alone with --tags preflight
   roles:
-    - preflight
+    - preflight                         # Run everything inside roles/preflight/tasks/main.yml
 
-- name: Common OS preparation (all nodes)
-  hosts: k8s_cluster
-  become: true
-  gather_facts: true
-  tags: [common]
+# ═════════════════════════════════════════════════════════════════════════════
+# PLAY 2 — Prepare the Operating System on every computer
+# PURPOSE: Install required software, tweak OS settings, disable swap, etc.
+# This makes every computer "Kubernetes-ready" before we actually install k8s.
+# ═════════════════════════════════════════════════════════════════════════════
+- name: Common OS preparation (all nodes)  # Label shown in terminal
+  hosts: k8s_cluster                       # Run on ALL computers (masters + workers)
+  become: true                             # Use sudo — need root to install packages and change settings
+  gather_facts: true                       # Re-collect facts (needed because roles reference OS type, architecture, etc.)
+  tags: [common]                           # Tag this section as "common"
   roles:
-    - common
-    - containerd
-    - kubernetes
+    - common       # roles/common/tasks/main.yml — OS settings, packages, swap, kernel modules
+    - containerd   # roles/containerd/tasks/main.yml — install the container engine
+    - kubernetes   # roles/kubernetes/tasks/main.yml — install kubeadm, kubelet, kubectl
 
-- name: Initialize Kubernetes master and install Cilium
-  hosts: masters
-  become: true
-  gather_facts: true
-  tags: [master, cilium, helm]
+# ═════════════════════════════════════════════════════════════════════════════
+# PLAY 3 — Start the Kubernetes BOSS computer (master / control plane)
+# PURPOSE: Run kubeadm init to bring the Kubernetes brain online, then install
+# Cilium (the networking layer) so pods can talk to each other.
+# Only runs on master computers — not workers.
+# ═════════════════════════════════════════════════════════════════════════════
+- name: Initialize Kubernetes master and install Cilium  # Label shown in terminal
+  hosts: masters                                          # Run ONLY on computers in the [masters] group
+  become: true                                            # Use sudo
+  gather_facts: true                                      # Collect facts — needed to detect architecture and IP
+  tags: [master, cilium, helm]                            # Multiple tags — run with --tags master, --tags cilium, or --tags helm
   roles:
-    - master
+    - master   # roles/master/tasks/main.yml — run kubeadm init, install Helm, install Cilium
 
-- name: Join worker nodes to the cluster
-  hosts: workers
-  become: true
-  gather_facts: true
-  tags: [worker]
+# ═════════════════════════════════════════════════════════════════════════════
+# PLAY 4 — Connect WORKER computers to the cluster
+# PURPOSE: Run kubeadm join on each worker so it registers with the master.
+# Only runs on worker computers — the master is already running.
+# ═════════════════════════════════════════════════════════════════════════════
+- name: Join worker nodes to the cluster  # Label shown in terminal
+  hosts: workers                           # Run ONLY on computers in the [workers] group
+  become: true                             # Use sudo
+  gather_facts: true                       # Collect facts — needed for OS-specific paths
+  tags: [worker]                           # Run alone with --tags worker
   roles:
-    - worker
+    - worker   # roles/worker/tasks/main.yml — run kubeadm join command
 
-- name: Post-install verification
-  hosts: masters
-  become: true
-  gather_facts: false
-  tags: [verify, post-install]
+# ═════════════════════════════════════════════════════════════════════════════
+# PLAY 5 — Verify the cluster is healthy
+# PURPOSE: After installation, check that everything came up correctly.
+# Waits for nodes and pods to be Ready before declaring success.
+# Prints the final cluster state so you can see it in your terminal.
+# ═════════════════════════════════════════════════════════════════════════════
+- name: Post-install verification   # Label shown in terminal
+  hosts: masters                    # Run verification commands from the master (it has kubectl access)
+  become: true                      # Use sudo
+  gather_facts: false               # Skip fact gathering — we don't need OS info for these kubectl commands
+  tags: [verify, post-install]      # Two tags — run with --tags verify or --tags post-install
   tasks:
+
+    # ── Wait for all nodes to be Ready ───────────────────────────────────────
     - name: Wait for all nodes to be Ready
+      # kubectl get nodes = ask Kubernetes "list all computers in the cluster"
+      # --no-headers = don't print the column header row (easier to count lines)
       command: kubectl get nodes --no-headers
       environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
-      register: nodes_status
+        KUBECONFIG: /etc/kubernetes/admin.conf  # Use this file as the kubectl credentials/config
+      register: nodes_status   # Save the command output into a variable called "nodes_status"
       until: >
+        # Keep retrying UNTIL both conditions are true:
+        # Condition 1: number of output lines equals total number of computers in the cluster
         nodes_status.stdout_lines | length == groups['k8s_cluster'] | length
+        # Condition 2: none of the lines contain the word "NotReady"
         and nodes_status.stdout_lines | select('search', 'NotReady') | list | length == 0
-      retries: 30
-      delay: 10
-      changed_when: false
+      retries: 30        # Try up to 30 times before giving up and calling it a failure
+      delay: 10          # Wait 10 seconds between each retry (30 retries × 10s = up to 5 minutes)
+      changed_when: false  # This task only reads data — it never CHANGES anything — don't mark it as "changed"
       tags: [verify]
 
+    # ── Wait for Cilium pods to be Running ───────────────────────────────────
     - name: Wait for Cilium pods to be Running
       command: >
+        # kubectl get pods = ask Kubernetes "list all mini-apps (pods)"
+        # -n kube-system = look in the "kube-system" folder (namespace)
+        # -l k8s-app=cilium = filter to only show pods with label "k8s-app=cilium"
+        # --field-selector=status.phase=Running = only show pods that are actually Running (not Pending/Crashed)
+        # --no-headers = skip the column header row
         kubectl get pods -n kube-system -l k8s-app=cilium
         --field-selector=status.phase=Running --no-headers
       environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
-      register: cilium_pods
-      until: cilium_pods.stdout_lines | length >= 1
-      retries: 24
-      delay: 15
-      changed_when: false
+        KUBECONFIG: /etc/kubernetes/admin.conf  # Use master's admin credentials to run kubectl
+      register: cilium_pods   # Save output into "cilium_pods" variable
+      until: cilium_pods.stdout_lines | length >= 1  # Keep retrying until at least 1 Cilium pod is Running
+      retries: 24      # Try up to 24 times
+      delay: 15        # Wait 15 seconds between retries (24 × 15s = up to 6 minutes)
+      changed_when: false  # Read-only task — doesn't change anything
       tags: [verify, cilium]
 
+    # ── Wait for CoreDNS pods to be Running ──────────────────────────────────
     - name: Wait for CoreDNS pods to be Running
       command: >
+        # CoreDNS = the DNS server inside the cluster (translates names to IPs inside k8s)
+        # Without CoreDNS running, pods can't find each other by name — only by IP.
+        # -l k8s-app=kube-dns = filter to only CoreDNS pods (they have this label)
         kubectl get pods -n kube-system -l k8s-app=kube-dns
         --field-selector=status.phase=Running --no-headers
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
-      register: coredns_pods
-      until: coredns_pods.stdout_lines | length >= 2
-      retries: 20
-      delay: 15
-      changed_when: false
+      register: coredns_pods   # Save output into "coredns_pods" variable
+      until: coredns_pods.stdout_lines | length >= 2  # Need at least 2 CoreDNS pods (for redundancy)
+      retries: 20    # Try up to 20 times
+      delay: 15      # Wait 15 seconds between retries (20 × 15s = up to 5 minutes)
+      changed_when: false  # Read-only
       tags: [verify]
 
+    # ── Print the final state of the cluster ─────────────────────────────────
     - name: Show final cluster state
+      # kubectl get nodes -o wide = list all computers in the cluster with extra details
+      # -o wide = "wide output" — shows extra columns like internal IP, OS image, kernel version
       command: kubectl get nodes -o wide
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
-      register: cluster_nodes
-      changed_when: false
+      register: cluster_nodes   # Save the output to print it in the next task
+      changed_when: false       # Read-only — just fetching info
       tags: [verify]
 
+    # ── Print the node list to terminal ──────────────────────────────────────
     - name: Print cluster summary
       debug:
+        # debug module = prints a message to your terminal during playbook execution
+        # msg = what to print
+        # cluster_nodes.stdout_lines = the output of the previous kubectl command, line by line
         msg: "{{ cluster_nodes.stdout_lines }}"
       tags: [verify]
 
+    # ── Tell the user where to find their kubeconfig ─────────────────────────
     - name: Print kubeconfig location
       debug:
+        # playbook_dir = the directory where site.yml lives (automatically set by Ansible)
+        # This tells you: "hey, your kubeconfig is saved HERE, run this export command to use kubectl"
         msg: "Kubeconfig saved to: {{ playbook_dir }}/kubeconfig — run: export KUBECONFIG={{ playbook_dir }}/kubeconfig"
       tags: [verify]

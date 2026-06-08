@@ -1,245 +1,396 @@
 ---
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE: roles/common/tasks/main.yml
+# PURPOSE: Prepare EVERY computer's operating system for Kubernetes.
+# This role runs on masters AND workers. It handles all the OS-level setup
+# that Kubernetes needs before you can actually install it.
+# Think of it as "getting the house ready" before moving furniture in.
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── Architecture & OS facts ────────────────────────────────────────────────
+
+# Task: Calculate and save some helpful variables we'll use throughout this role.
+# set_fact creates variables that other tasks can reference with {{ variable_name }}.
 - name: Set deb architecture fact
   set_fact:
+    # deb_arch = translate from Linux arch name to package repo arch name.
+    # arch_map is defined in group_vars/all.yml. Example: "x86_64" → "amd64"
+    # ansible_architecture = what Linux reports (x86_64 or aarch64)
     deb_arch: "{{ arch_map[ansible_architecture] }}"
-    # chrony service name differs by OS family
+
+    # chrony_svc = the name of the time-sync service differs by OS family.
+    # On Ubuntu/Debian it's called "chrony", on RedHat/Rocky it's called "chronyd".
+    # We detect this here so we can use {{ chrony_svc }} everywhere without if/else each time.
     chrony_svc: "{{ 'chrony' if ansible_os_family == 'Debian' else 'chronyd' }}"
-    # kubelet extra-args file path differs by OS family
+
+    # kubelet_env_file = where kubelet reads its startup arguments from.
+    # kubelet = the Kubernetes agent that runs on every computer.
+    # RedHat uses /etc/sysconfig/, Debian uses /etc/default/ — different paths, same purpose.
     kubelet_env_file: "{{ '/etc/sysconfig/kubelet' if ansible_os_family == 'RedHat' else '/etc/default/kubelet' }}"
-  tags: [always]
+  tags: [always]   # "always" = run this even if you filter tasks by --tags. We always need these variables.
 
 # ── Hostname & hosts ───────────────────────────────────────────────────────
+
+# Task: Set the computer's hostname to match what's in the inventory.
+# Why? Kubernetes identifies nodes by their hostname. If the hostname doesn't
+# match the inventory name, Kubernetes gets confused about which node is which.
 - name: Set hostname
-  hostname:
-    name: "{{ inventory_hostname }}"
+  hostname:           # "hostname" module = change the computer's hostname
+    name: "{{ inventory_hostname }}"   # Set it to the nickname from inventory (e.g. "master-1")
   tags: [common, hostname]
 
+# Task: Add all cluster computers to each computer's /etc/hosts file.
+# /etc/hosts = a local "phone book" — maps names to IP addresses.
+# Why? Even if DNS is down or slow, computers can still find each other by name.
+# Example line added: "192.168.1.11 worker-1"
 - name: Update /etc/hosts with cluster nodes
-  lineinfile:
-    path: /etc/hosts
+  lineinfile:            # "lineinfile" module = add/update a specific line in a file
+    path: /etc/hosts     # The local hostname lookup file on every Linux computer
     line: "{{ hostvars[item].ansible_host }} {{ item }}"
-    state: present
+    # hostvars[item].ansible_host = the IP address of computer "item"
+    # item                        = the nickname of that computer (e.g. "worker-1")
+    # So the line looks like: "192.168.1.11 worker-1"
+    state: present       # Make sure this line EXISTS in the file (add it if missing)
   loop: "{{ groups['k8s_cluster'] }}"
+  # groups['k8s_cluster'] = list of all computer nicknames
+  # loop = run this task once per computer, adding one line per computer to /etc/hosts
   tags: [common, hostname]
 
 # ── Timezone ──────────────────────────────────────────────────────────────
+
+# Task: Set all computers to the same timezone.
+# Why? Kubernetes TLS certificates, tokens, and logs all use timestamps.
+# If computers are in different timezones, logs become impossible to read
+# and certificate validation can fail unexpectedly.
 - name: Set timezone to Asia/Kolkata
-  community.general.timezone:
-    name: Asia/Kolkata
+  community.general.timezone:   # community.general = an extra Ansible collection (from requirements.yml)
+    name: Asia/Kolkata           # India Standard Time (IST, UTC+5:30)
   tags: [common, timezone]
 
 # ── SELinux (RedHat on-prem) ───────────────────────────────────────────────
+
+# Task: Configure SELinux security mode on RedHat-based systems.
+# SELinux = Security-Enhanced Linux — controls what each process is allowed to do.
+# Why permissive? In "enforcing" mode, Kubernetes actions get blocked by SELinux
+# rules that weren't written for Kubernetes. "permissive" logs violations but
+# doesn't block them — so Kubernetes works, and you can see what it's doing.
 - name: Configure SELinux
-  ansible.posix.selinux:
-    policy: targeted
-    state: "{{ selinux_state }}"
-  when: ansible_os_family == "RedHat"
+  ansible.posix.selinux:   # ansible.posix = another extra Ansible collection
+    policy: targeted         # "targeted" = only apply SELinux to specific programs (not the whole OS)
+    state: "{{ selinux_state }}"   # From group_vars/all.yml — defaults to "permissive"
+  when: ansible_os_family == "RedHat"   # Only run on RedHat/Rocky/AlmaLinux — Ubuntu doesn't use SELinux
   tags: [common, selinux]
 
 # ── Package update & base packages ────────────────────────────────────────
+
+# Task: Update ALL existing software packages on Debian/Ubuntu.
+# Why? Security patches and bug fixes. Running Kubernetes on outdated software
+# can cause subtle issues. Full upgrade before install = clean foundation.
 - name: Full system upgrade (Debian)
-  apt:
-    upgrade: full
-    update_cache: true
-    cache_valid_time: 3600
-  when: ansible_os_family == "Debian"
+  apt:                    # "apt" module = manage packages on Debian/Ubuntu (like running apt-get)
+    upgrade: full          # Upgrade ALL packages to their latest versions
+    update_cache: true     # First run "apt-get update" to refresh the package list
+    cache_valid_time: 3600 # Don't refresh the cache if it was refreshed within the last 3600 seconds (1 hour)
+  when: ansible_os_family == "Debian"   # Only on Ubuntu/Debian (not RedHat)
   tags: [common, packages]
 
+# Task: Install the base tools Kubernetes needs on Debian/Ubuntu.
+# These aren't Kubernetes itself — they're supporting tools it depends on.
 - name: Install prerequisite packages (Debian)
   apt:
     name:
-      - apt-transport-https
-      - ca-certificates
-      - curl
-      - wget
-      - gnupg
-      - lsb-release
-      - socat
-      - conntrack
-      - ipset
-      - ipvsadm
-      - chrony
-      - open-iscsi
-      - nfs-common
-    state: present
-    cache_valid_time: 3600
+      - apt-transport-https  # Allows apt to download packages over HTTPS (secure) instead of plain HTTP
+      - ca-certificates      # Trusted HTTPS certificate authorities — needed to verify download servers
+      - curl                 # Command-line tool to download files from URLs
+      - wget                 # Another download tool (some scripts use wget instead of curl)
+      - gnupg                # GNU Privacy Guard — used to verify GPG signatures on packages
+      - lsb-release          # "Linux Standard Base" — provides distro info used in repo URLs
+      - socat                # Network relay tool — used by kubectl port-forward
+      - conntrack            # Tracks network connections — required by kube-proxy and Cilium
+      - ipset                # Manages sets of IPs/ports — used by network filtering rules
+      - ipvsadm              # Manages IPVS (IP Virtual Server) — load balancing inside the kernel
+      - chrony               # Time synchronization service (keeps clock accurate)
+      - open-iscsi           # iSCSI client — for connecting to network storage (Longhorn, etc.)
+      - nfs-common           # NFS client tools — for mounting NFS network storage volumes
+    state: present           # Make sure all these packages ARE installed
+    cache_valid_time: 3600   # Reuse cached package list if fresh enough
   when: ansible_os_family == "Debian"
   tags: [common, packages]
 
+# Task: Install the same base tools on RedHat/Rocky/AlmaLinux.
+# Package names differ from Debian (e.g. "conntrack" vs "conntrack-tools").
 - name: Install prerequisite packages (RedHat)
-  yum:
+  yum:             # "yum" module = manage packages on RedHat-family systems
     name:
-      - curl
-      - wget
-      - ca-certificates
-      - socat
-      - conntrack-tools        # package name differs from Debian's 'conntrack'
-      - ipset
-      - ipvsadm
-      - chrony
-      - iscsi-initiator-utils
-      - nfs-utils
+      - curl                   # Download files from URLs
+      - wget                   # Another download tool
+      - ca-certificates        # Trusted HTTPS certificate authorities
+      - socat                  # Network relay tool for kubectl port-forward
+      - conntrack-tools        # Track network connections (RedHat name differs from Debian's "conntrack")
+      - ipset                  # Manage sets of IPs for network filtering
+      - ipvsadm                # Kernel-level load balancing tool
+      - chrony                 # Time synchronization
+      - iscsi-initiator-utils  # iSCSI client (RedHat name for "open-iscsi")
+      - nfs-utils              # NFS client tools (RedHat name for "nfs-common")
     state: present
   when: ansible_os_family == "RedHat"
   tags: [common, packages]
 
 # ── NTP ───────────────────────────────────────────────────────────────────
+
+# Task: Write the chrony time-sync configuration file.
+# "chrony" is the time synchronization service that keeps the computer's clock accurate.
+# Why does clock accuracy matter? Kubernetes uses time for:
+#   - TLS certificate validity (certs have expiry times)
+#   - Token expiration
+#   - Log timestamps (you can't debug logs from 3 servers if their clocks are off)
 - name: Configure chrony
-  template:
-    src: chrony.conf.j2
-    dest: /etc/chrony.conf
-    mode: "0644"
-  notify: restart chrony
-  when: configure_ntp
+  template:             # "template" module = fill in a template file with variables and copy it
+    src: chrony.conf.j2 # Source: roles/common/templates/chrony.conf.j2 (a template with {{ }} variables)
+    dest: /etc/chrony.conf  # Destination: the actual config file chrony reads
+    mode: "0644"        # File permissions: owner can read+write, everyone else can read
+  notify: restart chrony  # After writing this file, tell the "restart chrony" handler to run
+  # notify = instead of restarting immediately, Ansible queues the restart and runs it at the end.
+  # This prevents multiple restarts if multiple tasks all change the same config file.
+  when: configure_ntp   # Only do this if configure_ntp is true in group_vars/all.yml
   tags: [common, ntp]
 
+# Task: Start the chrony service and make sure it starts automatically on reboot.
 - name: Enable chrony (service name is OS-specific)
-  service:
-    name: "{{ chrony_svc }}"
-    state: started
-    enabled: true
+  service:               # "service" module = manage system services (start/stop/enable/disable)
+    name: "{{ chrony_svc }}"  # Use the variable we set earlier — "chrony" or "chronyd" depending on OS
+    state: started         # Make sure the service IS running right now
+    enabled: true          # Make sure the service starts automatically when the computer reboots
   when: configure_ntp
   tags: [common, ntp]
 
 # ── iSCSI daemon ──────────────────────────────────────────────────────────
+
+# Task: Start the iSCSI service.
+# iSCSI = a protocol for connecting to storage over a network (like a network hard drive).
+# Why enable it? Kubernetes storage drivers like Longhorn and OpenEBS use iSCSI.
+# Even if you don't use network storage now, having it enabled prevents errors later.
 - name: Enable and start iscsid
   service:
-    name: iscsid
-    state: started
-    enabled: true
+    name: iscsid      # iscsid = the iSCSI daemon (background service)
+    state: started    # Make sure it's running
+    enabled: true     # Start it on reboot too
   tags: [common, storage]
 
 # ── Swap ──────────────────────────────────────────────────────────────────
+
+# Task: Turn off swap memory RIGHT NOW (doesn't survive reboot).
+# Swap = when Linux uses the hard disk as extra fake RAM (much slower than real RAM).
+# Why disable swap for Kubernetes?
+#   Kubernetes makes scheduling decisions based on how much memory is "available".
+#   With swap, the OS can secretly use disk as RAM, making those numbers unreliable.
+#   Kubernetes policy: swap must be OFF or it refuses to start.
 - name: Disable swap (runtime)
-  command: swapoff -a
-  changed_when: false
+  command: swapoff -a   # swapoff -a = turn off ALL swap partitions immediately
+  changed_when: false    # This command always succeeds but doesn't "change" anything persistent
   tags: [common, swap]
 
+# Task: Prevent swap from coming back after a reboot.
+# The previous task only disables swap for the current session.
+# /etc/fstab = the file Linux reads on boot to decide what to mount.
+# We need to comment out any swap entries so they don't get re-enabled at boot.
 - name: Disable swap (persistent)
-  replace:
-    path: /etc/fstab
-    regexp: '^ *([^#].* swap .*)$'
-    replace: '# \1'
+  replace:               # "replace" module = find a pattern in a file and replace it
+    path: /etc/fstab     # The filesystem table — defines what gets mounted at boot
+    regexp: '^ *([^#].* swap .*)$'   # Find any non-commented line containing " swap "
+    replace: '# \1'      # Replace it with the same line but commented out (add "# " at the front)
+    # Example: "UUID=xxx none swap sw 0 0" → "# UUID=xxx none swap sw 0 0"
   tags: [common, swap]
 
 # ── Kernel modules ────────────────────────────────────────────────────────
+
+# Task: Write a config file so these kernel modules load automatically on reboot.
+# Kernel modules = plugins for the Linux kernel (the OS core).
+# /etc/modules-load.d/ = a directory where you list modules to load at boot time.
 - name: Write kernel modules config (persistent)
-  copy:
-    dest: /etc/modules-load.d/k8s.conf
+  copy:                    # "copy" module = create/write a file with given content
+    dest: /etc/modules-load.d/k8s.conf   # This file tells systemd which modules to load at boot
     content: |
-      overlay
-      br_netfilter
-      iscsi_tcp
-      dm_crypt
-    mode: "0644"
+      overlay      # Needed by containerd — allows containers to share filesystem layers efficiently
+                   # (like transparent sheets on top of each other — changes only go to the top sheet)
+      br_netfilter # Needed by Kubernetes networking — makes the Linux firewall (iptables/nftables)
+                   # able to see and filter traffic that goes THROUGH Linux bridges (virtual network switches)
+      iscsi_tcp    # Needed for iSCSI network storage connectivity
+      dm_crypt     # Needed for encrypted storage volumes (used by some CSI storage drivers)
+    mode: "0644"   # File permissions: readable by everyone, writable only by root
   tags: [common, kernel]
 
+# Task: Load those kernel modules RIGHT NOW (doesn't wait for reboot).
+# The previous task makes them load at boot. This task loads them immediately
+# so we don't have to reboot in the middle of installation.
 - name: Load kernel modules (runtime)
-  community.general.modprobe:
-    name: "{{ item }}"
-    state: present
+  community.general.modprobe:   # "modprobe" module = load/unload Linux kernel modules
+    name: "{{ item }}"          # The module to load (filled in by the loop below)
+    state: present              # Make sure this module IS loaded
   loop:
-    - overlay
-    - br_netfilter
-    - iscsi_tcp
-    - dm_crypt
+    - overlay       # Load overlay filesystem module now
+    - br_netfilter  # Load bridge network filtering module now
+    - iscsi_tcp     # Load iSCSI over TCP module now
+    - dm_crypt      # Load device-mapper encryption module now
+  # loop = run this task 4 times, once per module in the list
   tags: [common, kernel]
 
 # ── Sysctl ────────────────────────────────────────────────────────────────
+
+# Task: Set low-level kernel network parameters required by Kubernetes.
+# "sysctl" = a way to tune Linux kernel behavior at runtime without rebooting.
+# These settings allow Kubernetes networking to work correctly.
 - name: Set required sysctl parameters
-  ansible.posix.sysctl:
-    name: "{{ item.key }}"
-    value: "{{ item.value }}"
-    state: present
-    sysctl_file: /etc/sysctl.d/k8s.conf
-    reload: true
+  ansible.posix.sysctl:           # ansible.posix collection's sysctl module
+    name: "{{ item.key }}"        # The kernel parameter name
+    value: "{{ item.value }}"     # The value to set it to
+    state: present                # Make sure this parameter IS set
+    sysctl_file: /etc/sysctl.d/k8s.conf  # Save to this file so settings persist after reboot
+    reload: true                  # Apply the change immediately without rebooting
   loop:
+    # net.bridge.bridge-nf-call-iptables = 1
+    # Makes IPv4 traffic crossing Linux bridges go through iptables rules.
+    # Without this: pod-to-pod traffic bypasses the firewall — Kubernetes networking breaks.
     - { key: net.bridge.bridge-nf-call-iptables,  value: "1" }
+
+    # net.bridge.bridge-nf-call-ip6tables = 1
+    # Same as above but for IPv6 traffic.
     - { key: net.bridge.bridge-nf-call-ip6tables, value: "1" }
+
+    # net.ipv4.ip_forward = 1
+    # Allow the computer to FORWARD packets from one network interface to another.
+    # Without this: the computer only handles its own traffic, can't route pod traffic.
     - { key: net.ipv4.ip_forward,                 value: "1" }
+
+    # net.ipv6.conf.all.forwarding = 1
+    # Same as ip_forward but for IPv6 packets.
     - { key: net.ipv6.conf.all.forwarding,        value: "1" }
+
+    # kernel.unprivileged_bpf_disabled = 0
+    # Allow unprivileged (non-root) programs to use eBPF (extended Berkeley Packet Filter).
+    # Cilium uses eBPF for its high-speed networking. Setting to 0 = allow it.
     - { key: kernel.unprivileged_bpf_disabled,    value: "0" }
+
+    # net.core.bpf_jit_enable = 1
+    # Enable JIT (Just-In-Time) compilation for eBPF programs.
+    # JIT = compiles eBPF code to native CPU instructions at runtime — much faster.
+    # Cilium benefits significantly from this being enabled.
     - { key: net.core.bpf_jit_enable,             value: "1" }
   tags: [common, sysctl]
 
 # ── System limits ─────────────────────────────────────────────────────────
+
+# Task: Increase the maximum number of open files and processes.
+# Why? Kubernetes runs many processes and opens many files simultaneously.
+# Linux has default limits (usually 1024 open files) that are way too low.
+# Without increasing these, Kubernetes will hit "too many open files" errors.
 - name: Write system limits for Kubernetes
   copy:
-    dest: /etc/security/limits.d/99-kubernetes.conf
+    dest: /etc/security/limits.d/99-kubernetes.conf   # Files in limits.d/ are loaded by PAM on login
     mode: "0644"
     content: |
-      *               soft    nofile          1048576
-      *               hard    nofile          1048576
-      root            soft    nofile          1048576
-      root            hard    nofile          1048576
-      *               soft    nproc           1048576
-      *               hard    nproc           1048576
-      root            soft    nproc           1048576
-      root            hard    nproc           1048576
+      # Format: <who> <hard/soft> <type> <value>
+      # soft limit = warning level (can be temporarily exceeded)
+      # hard limit = absolute maximum (cannot be exceeded)
+      # nofile = maximum number of open file descriptors (open files, sockets, pipes)
+      # nproc  = maximum number of processes a user can run
+
+      *               soft    nofile          1048576   # All users: soft limit = 1 million open files
+      *               hard    nofile          1048576   # All users: hard limit = 1 million open files
+      root            soft    nofile          1048576   # Root user also gets 1 million (not inherited from "*")
+      root            hard    nofile          1048576   # Root user hard limit
+      *               soft    nproc           1048576   # All users: 1 million processes
+      *               hard    nproc           1048576   # All users: 1 million processes hard limit
+      root            soft    nproc           1048576   # Root: 1 million processes
+      root            hard    nproc           1048576   # Root: 1 million processes hard limit
   tags: [common, limits]
 
 # ── multipathd (must be masked before open-iscsi starts) ─────────────────
+
+# Task: Disable multipathd — it interferes with iSCSI storage.
+# multipathd = a service that manages multiple paths to storage devices (like having
+# two cables to the same hard drive for redundancy).
+# Problem: multipathd fights with iSCSI (open-iscsi) over who controls the storage.
+# Solution: "mask" it — masking is stronger than disable. A masked service
+# CANNOT be started, even by other services or scripts.
 - name: Mask multipathd to prevent iSCSI interference
-  systemd:
-    name: "{{ item }}"
-    masked: true
+  systemd:               # "systemd" module = control systemd services
+    name: "{{ item }}"   # Service name (filled in by the loop)
+    masked: true          # Mask it = make it impossible to start (stronger than just "disabled")
   loop:
-    - multipathd.service
-    - multipathd.socket
-  failed_when: false
+    - multipathd.service  # The main multipathd service
+    - multipathd.socket   # The socket that can trigger multipathd to start
+  failed_when: false      # Don't fail if multipathd doesn't exist on this computer — that's fine
   tags: [common, storage]
 
+# Task: Stop multipathd if it's currently running.
+# Masking prevents future starts, but doesn't stop it if it's already running.
 - name: Stop multipathd if running
   systemd:
     name: "{{ item }}"
-    state: stopped
+    state: stopped   # Stop the service right now if it's running
   loop:
     - multipathd.service
     - multipathd.socket
-  failed_when: false
+  failed_when: false   # Don't fail if it's already stopped or doesn't exist
   tags: [common, storage]
 
 # ── kubelet extra args ─────────────────────────────────────────────────────
-# AWS: resolved after IMDSv2 metadata tasks below
-# On-prem / non-AWS: written here using node_ip (overridable per-host)
+
+# Task: Tell kubelet (the Kubernetes agent) which IP address to use.
+# Why? If a computer has multiple network cards (NICs), kubelet might pick the wrong one.
+# We explicitly tell it which IP to advertise to Kubernetes.
+# This section handles on-prem (not AWS). AWS gets its IP from the metadata server below.
 - name: Write kubelet extra args (on-prem / non-AWS)
   copy:
-    dest: "{{ kubelet_env_file }}"
+    dest: "{{ kubelet_env_file }}"   # Path differs by OS: /etc/default/kubelet or /etc/sysconfig/kubelet
     mode: "0644"
+    # KUBELET_EXTRA_ARGS = environment variable that kubelet reads for extra startup flags
+    # --node-ip = tell kubelet "this is my IP address, use this one, not whatever you detect"
+    # node_ip is set in group_vars/all.yml and can be overridden per-host in inventory
     content: "KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}\n"
-  when: cloud_provider != "aws"
+  when: cloud_provider != "aws"   # Only for non-AWS. AWS does this differently (see below).
   tags: [common]
 
 # ── AWS IMDSv2 — kubelet provider-id ─────────────────────────────────────
+# The next 4 tasks are ONLY for AWS. Skip these if you're on-prem.
+# IMDSv2 = Instance Metadata Service v2 — a special URL on AWS that gives EC2 info.
+# Why AWS needs different handling:
+#   AWS needs kubelet to know the "provider-id" (aws:///availability-zone/instance-id)
+#   so AWS cloud features (like EBS volumes, load balancers) work with Kubernetes.
+
+# Task: Get a security token from AWS metadata service (required by IMDSv2).
+# IMDSv2 requires a token to prevent SSRF attacks. Step 1: get the token.
 - name: Fetch IMDSv2 token
   uri:
-    url: http://169.254.169.254/latest/api/token
-    method: PUT
+    url: http://169.254.169.254/latest/api/token   # AWS magic IP — only works inside EC2
+    method: PUT          # IMDSv2 uses PUT (not GET) to get the token — a security requirement
     headers:
-      X-aws-ec2-metadata-token-ttl-seconds: "21600"
-    return_content: true
-    timeout: 5
-  register: imds_token
-  when: cloud_provider == "aws"
-  failed_when: false
+      X-aws-ec2-metadata-token-ttl-seconds: "21600"   # Token is valid for 21600 seconds = 6 hours
+    return_content: true  # Save the response body (the token) into the result variable
+    timeout: 5            # Give up after 5 seconds (if not on AWS, this will fail quickly)
+  register: imds_token    # Save the token into "imds_token" for the next tasks
+  when: cloud_provider == "aws"   # Only run on AWS
+  failed_when: false              # Don't crash if we can't reach the metadata server (e.g. on-prem)
   tags: [common, aws]
 
+# Task: Use the token to get this EC2 instance's ID.
 - name: Fetch AWS instance-id
   uri:
-    url: http://169.254.169.254/latest/meta-data/instance-id
+    url: http://169.254.169.254/latest/meta-data/instance-id   # Returns something like "i-0abc123def456789"
     headers:
-      X-aws-ec2-metadata-token: "{{ imds_token.content }}"
-    return_content: true
+      X-aws-ec2-metadata-token: "{{ imds_token.content }}"   # Use the token we got in the previous task
+    return_content: true   # Save the instance ID in the result
     timeout: 5
-  register: aws_instance_id_raw
-  when: cloud_provider == "aws" and imds_token is not failed
+  register: aws_instance_id_raw   # Save into "aws_instance_id_raw"
+  when: cloud_provider == "aws" and imds_token is not failed   # Only if previous task succeeded
   failed_when: false
   tags: [common, aws]
 
+# Task: Get this EC2 instance's private IP address.
 - name: Fetch AWS private IP
   uri:
-    url: http://169.254.169.254/latest/meta-data/local-ipv4
+    url: http://169.254.169.254/latest/meta-data/local-ipv4   # Returns the private IP like "10.0.1.45"
     headers:
       X-aws-ec2-metadata-token: "{{ imds_token.content }}"
     return_content: true
@@ -249,9 +400,10 @@
   failed_when: false
   tags: [common, aws]
 
+# Task: Get this EC2 instance's availability zone (like "us-east-1a").
 - name: Fetch AWS availability zone
   uri:
-    url: http://169.254.169.254/latest/meta-data/placement/availability-zone
+    url: http://169.254.169.254/latest/meta-data/placement/availability-zone   # Returns e.g. "us-east-1a"
     headers:
       X-aws-ec2-metadata-token: "{{ imds_token.content }}"
     return_content: true
@@ -261,67 +413,90 @@
   failed_when: false
   tags: [common, aws]
 
+# Task: Write kubelet arguments for AWS including the provider-id.
+# provider-id = a unique AWS identifier for this EC2 instance.
+# Format: aws:///us-east-1a/i-0abc123def456789
+# Kubernetes uses this to talk to AWS APIs for cloud-native features.
 - name: Write kubelet extra args (AWS)
   copy:
     dest: "{{ kubelet_env_file }}"
     mode: "0644"
     content: "KUBELET_EXTRA_ARGS=--cloud-provider=external --provider-id=aws:///{{ aws_az_raw.content }}/{{ aws_instance_id_raw.content }} --node-ip={{ aws_private_ip_raw.content }}\n"
+    # --cloud-provider=external = tell kubelet to use an external cloud controller (not built-in)
+    # --provider-id=aws:///az/instance-id = the unique AWS ID for this node
+    # --node-ip = use the private IP for Kubernetes communication
   when:
     - cloud_provider == "aws"
-    - aws_instance_id_raw is not failed
-    - aws_instance_id_raw.content is defined
+    - aws_instance_id_raw is not failed          # Only if we successfully got the instance ID
+    - aws_instance_id_raw.content is defined     # And it actually has content (not empty)
   tags: [common, aws]
 
+# Task: Tell systemd to re-read its config files.
+# We just wrote a new kubelet config file. Systemd won't see it until we reload.
+# daemon_reload = equivalent to running "systemctl daemon-reload" on the command line.
 - name: Reload systemd daemon
   systemd:
-    daemon_reload: true
+    daemon_reload: true   # Re-read all systemd unit files and configurations
   tags: [common]
 
 # ── Firewall ──────────────────────────────────────────────────────────────
+
+# Task: Turn off firewalld on RedHat systems (when using cloud security groups or no firewall).
+# Why? When disable_host_firewall is true (the default), we trust the external network
+# to handle traffic filtering. A local firewall would just add confusion and block things.
 - name: Disable firewalld (cloud — SG handles rules)
   service:
-    name: firewalld
-    state: stopped
-    enabled: false
+    name: firewalld   # firewalld = the default firewall daemon on RedHat/Rocky/AlmaLinux
+    state: stopped    # Stop it right now
+    enabled: false    # Don't start it on reboot either
   when:
-    - disable_host_firewall
-    - ansible_os_family == "RedHat"
-  failed_when: false
+    - disable_host_firewall              # Only if we said "turn off the firewall" in settings
+    - ansible_os_family == "RedHat"     # Only on RedHat family (Ubuntu/Debian use ufw instead)
+  failed_when: false  # Don't fail if firewalld isn't installed at all
   tags: [common, firewall]
 
+# Task: Turn off ufw on Debian/Ubuntu systems.
+# ufw = "Uncomplicated Firewall" — the default firewall on Ubuntu/Debian.
 - name: Disable ufw (cloud — SG handles rules)
   service:
-    name: ufw
+    name: ufw         # ufw = Ubuntu/Debian's firewall daemon
     state: stopped
     enabled: false
   when:
     - disable_host_firewall
-    - ansible_os_family == "Debian"
+    - ansible_os_family == "Debian"     # Only on Ubuntu/Debian (RedHat uses firewalld)
   failed_when: false
   tags: [common, firewall]
 
 # ── On-prem firewall: firewalld (RHEL) ────────────────────────────────────
+# The tasks below ONLY run when disable_host_firewall is FALSE.
+# They open specific ports Kubernetes needs, instead of turning off the firewall entirely.
+
+# Task: Open Kubernetes-required ports on RedHat master computers.
+# Each port serves a specific purpose in the Kubernetes control plane.
 - name: Open required ports via firewalld (on-prem masters)
   ansible.posix.firewalld:
-    port: "{{ item }}"
-    permanent: true
-    state: enabled
-    immediate: true
+    port: "{{ item }}"   # The port/range to open (filled in by loop)
+    permanent: true       # Keep this rule after firewall restart
+    state: enabled        # Open this port
+    immediate: true       # Apply the rule RIGHT NOW (don't wait for restart)
   loop:
-    - "6443/tcp"
-    - "2379-2380/tcp"
-    - "10250/tcp"
-    - "10259/tcp"
-    - "10257/tcp"
-    - "4240/tcp"
-    - "8472/udp"
-    - "51871/udp"
+    - "6443/tcp"       # Kubernetes API server — ALL kubectl commands go here
+    - "2379-2380/tcp"  # etcd — the key-value database storing ALL cluster state
+    - "10250/tcp"      # kubelet API — what the master uses to talk to this node
+    - "10259/tcp"      # kube-scheduler — decides which worker runs each pod
+    - "10257/tcp"      # kube-controller-manager — maintains desired cluster state
+    - "4240/tcp"       # Cilium health checks — monitors network health between nodes
+    - "8472/udp"       # Cilium VXLAN overlay — tunnels pod traffic between nodes
+    - "51871/udp"      # Cilium WireGuard encryption (if enabled)
   when:
-    - not disable_host_firewall
-    - ansible_os_family == "RedHat"
-    - inventory_hostname in groups['masters']
+    - not disable_host_firewall                         # Only when firewall IS enabled
+    - ansible_os_family == "RedHat"                     # Only on RedHat family
+    - inventory_hostname in groups['masters']            # Only on master computers
   tags: [common, firewall]
 
+# Task: Open Kubernetes-required ports on RedHat worker computers.
+# Workers need fewer ports open than masters (no etcd, no scheduler, etc.)
 - name: Open required ports via firewalld (on-prem workers)
   ansible.posix.firewalld:
     port: "{{ item }}"
@@ -329,78 +504,90 @@
     state: enabled
     immediate: true
   loop:
-    - "10250/tcp"
-    - "30000-32767/tcp"
-    - "4240/tcp"
-    - "8472/udp"
-    - "51871/udp"
+    - "10250/tcp"        # kubelet API — master contacts workers through this
+    - "30000-32767/tcp"  # NodePort range — when you expose a service, it gets a port here
+                         # Users access your apps via <worker-ip>:<NodePort>
+    - "4240/tcp"         # Cilium health check
+    - "8472/udp"         # Cilium VXLAN tunnel
+    - "51871/udp"        # Cilium WireGuard
   when:
     - not disable_host_firewall
     - ansible_os_family == "RedHat"
-    - inventory_hostname in groups['workers']
+    - inventory_hostname in groups['workers']   # Only on worker computers
   tags: [common, firewall]
 
 # ── On-prem firewall: ufw (Ubuntu/Debian) ─────────────────────────────────
-# SSH must be allowed BEFORE ufw is enabled to prevent control-machine lockout.
+
+# Task: Allow SSH BEFORE enabling ufw.
+# CRITICAL safety step: if we enable ufw without allowing SSH first,
+# the firewall will block our own SSH connection and we get LOCKED OUT.
+# No more remote access = disaster on a remote server.
 - name: Allow SSH via ufw (prevent lockout)
   community.general.ufw:
-    rule: allow
-    port: "22"
-    proto: tcp
+    rule: allow   # Create an "allow" rule (not "deny")
+    port: "22"    # Port 22 = SSH
+    proto: tcp    # TCP protocol (SSH always uses TCP)
   when:
     - not disable_host_firewall
     - ansible_os_family == "Debian"
   tags: [common, firewall]
 
+# Task: Open Kubernetes ports on Ubuntu/Debian master computers.
 - name: Open required ports via ufw (on-prem masters)
   community.general.ufw:
     rule: allow
-    port: "{{ item.port }}"
-    proto: "{{ item.proto }}"
+    port: "{{ item.port }}"    # Port number (from loop)
+    proto: "{{ item.proto }}"  # Protocol: tcp or udp (from loop)
   loop:
-    - { port: "6443",       proto: tcp }
-    - { port: "2379:2380",  proto: tcp }
-    - { port: "10250",      proto: tcp }
-    - { port: "10259",      proto: tcp }
-    - { port: "10257",      proto: tcp }
-    - { port: "4240",       proto: tcp }
-    - { port: "8472",       proto: udp }
-    - { port: "51871",      proto: udp }
+    - { port: "6443",       proto: tcp }   # Kubernetes API server
+    - { port: "2379:2380",  proto: tcp }   # etcd (note: ufw uses ":" for ranges, firewalld uses "-")
+    - { port: "10250",      proto: tcp }   # kubelet API
+    - { port: "10259",      proto: tcp }   # kube-scheduler
+    - { port: "10257",      proto: tcp }   # kube-controller-manager
+    - { port: "4240",       proto: tcp }   # Cilium health check
+    - { port: "8472",       proto: udp }   # Cilium VXLAN tunnel
+    - { port: "51871",      proto: udp }   # Cilium WireGuard
   when:
     - not disable_host_firewall
     - ansible_os_family == "Debian"
     - inventory_hostname in groups['masters']
   tags: [common, firewall]
 
+# Task: Open Kubernetes ports on Ubuntu/Debian worker computers.
 - name: Open required ports via ufw (on-prem workers)
   community.general.ufw:
     rule: allow
     port: "{{ item.port }}"
     proto: "{{ item.proto }}"
   loop:
-    - { port: "10250",      proto: tcp }
-    - { port: "30000:32767", proto: tcp }
-    - { port: "4240",       proto: tcp }
-    - { port: "8472",       proto: udp }
-    - { port: "51871",      proto: udp }
+    - { port: "10250",       proto: tcp }   # kubelet API
+    - { port: "30000:32767", proto: tcp }   # NodePort service range
+    - { port: "4240",        proto: tcp }   # Cilium health check
+    - { port: "8472",        proto: udp }   # Cilium VXLAN tunnel
+    - { port: "51871",       proto: udp }   # Cilium WireGuard
   when:
     - not disable_host_firewall
     - ansible_os_family == "Debian"
     - inventory_hostname in groups['workers']
   tags: [common, firewall]
 
+# Task: Set the default rule — block ALL incoming traffic that wasn't explicitly allowed.
+# Without this, ufw allows everything by default (pointless firewall).
 - name: Set ufw default incoming policy to deny
   community.general.ufw:
-    default: deny
-    direction: incoming
+    default: deny       # Block incoming connections by default
+    direction: incoming # Only applies to incoming traffic (not outgoing)
   when:
     - not disable_host_firewall
     - ansible_os_family == "Debian"
   tags: [common, firewall]
 
+# Task: Actually turn on the ufw firewall.
+# All previous ufw tasks set up the RULES but didn't enable the firewall yet.
+# This final step turns ufw on with all the rules we just configured.
 - name: Enable ufw
   community.general.ufw:
-    state: enabled
+    state: enabled   # Turn the firewall ON
   when:
     - not disable_host_firewall
     - ansible_os_family == "Debian"

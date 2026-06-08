@@ -1,32 +1,123 @@
-apiVersion: kubeadm.k8s.io/v1beta4
-kind: InitConfiguration
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE: roles/master/templates/kubeadm-init.yaml.j2
+# PURPOSE: The configuration file for "kubeadm init" — the command that starts
+# the Kubernetes control plane on the master computer.
+#
+# This is a Jinja2 template — Ansible fills in {{ variables }} before using it.
+# The final file is written to /etc/kubernetes/kubeadm-init.yaml on the master.
+#
+# YAML uses "---" to separate multiple documents in one file.
+# Each section (InitConfiguration, ClusterConfiguration, KubeletConfiguration)
+# is a separate Kubernetes config object.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Section 1: InitConfiguration ─────────────────────────────────────────
+# Controls how THIS specific node is initialized.
+# This section is local to this one master computer.
+
+apiVersion: kubeadm.k8s.io/v1beta4   # The version of the kubeadm config API to use.
+                                       # kubeadm uses versioned APIs so old configs stay compatible.
+kind: InitConfiguration               # This is the "InitConfiguration" type of object.
+                                       # "kind" = what type of config this is.
 localAPIEndpoint:
+  # advertiseAddress = which IP address the API server will listen on and tell others about.
+  # {{ _apiserver_ip }} = filled in by Ansible — either the manually set IP or the auto-detected one.
   advertiseAddress: "{{ _apiserver_ip }}"
-  bindPort: 6443
+  bindPort: 6443   # The port the API server listens on. 6443 is the Kubernetes standard port.
+                   # All kubectl commands go to this port. Think of it as the "front door".
+
 nodeRegistration:
+  # criSocket = the path to the container runtime's socket file.
+  # A socket = a special file that lets programs communicate with each other.
+  # containerd (our container runtime) listens on this socket for instructions.
+  # kubeadm uses this to tell containerd to pull images and start containers.
   criSocket: unix:///var/run/containerd/containerd.sock
+
+  # imagePullPolicy = when should Kubernetes pull a container image from the internet?
+  # IfNotPresent = only download the image if it's not already cached on this computer.
+  # Why? Avoids unnecessary downloads. If the image is already here, use it immediately.
   imagePullPolicy: IfNotPresent
+
 {% if cloud_provider == 'aws' %}
+  # kubeletExtraArgs = extra startup flags to pass to kubelet.
+  # This block ONLY appears in the config file when cloud_provider == "aws".
+  # {% if %} is Jinja2 templating — Ansible includes/excludes this block based on the condition.
   kubeletExtraArgs:
+    # cloud-provider: external = tell kubelet "don't use a built-in cloud provider, use an external one".
+    # On AWS, this enables Kubernetes to integrate with AWS services (EBS, ELB, etc.)
+    # via the AWS Cloud Controller Manager (a separate component you'd install separately).
     cloud-provider: external
 {% endif %}
+
 skipPhases:
+  # skipPhases = list of kubeadm init phases to NOT run.
+  # By default, kubeadm installs kube-proxy (for network routing inside the cluster).
+  # We skip it because Cilium REPLACES kube-proxy with a faster eBPF implementation.
+  # Installing both would cause conflicts — two things fighting to manage the same networking.
   - addon/kube-proxy
+
 ---
+# ── Section 2: ClusterConfiguration ─────────────────────────────────────
+# Global settings for the entire Kubernetes cluster.
+# These settings are stored in etcd and shared across all components.
+
 apiVersion: kubeadm.k8s.io/v1beta4
-kind: ClusterConfiguration
+kind: ClusterConfiguration   # This is the "ClusterConfiguration" type.
+
+# kubernetesVersion = which version of Kubernetes control plane images to pull and run.
+# "v{{ kubernetes_version }}" = filled in as e.g. "v1.36.1"
+# The "v" prefix is required by kubeadm.
 kubernetesVersion: "v{{ kubernetes_version }}"
-clusterName: kubernetes
+
+clusterName: kubernetes   # A name for this cluster. Used in kubeconfig files and logs.
+                           # Doesn't affect functionality — just a label.
+
 networking:
+  # dnsDomain = the internal DNS suffix for services inside the cluster.
+  # "cluster.local" is the standard default.
+  # Example: a service named "myapp" in namespace "default" is reachable at:
+  # "myapp.default.svc.cluster.local" from any pod.
   dnsDomain: cluster.local
+
+  # podSubnet = the IP range for pods (mini-apps) inside the cluster.
+  # {{ pod_network_cidr }} = "10.244.0.0/16" from group_vars/all.yml
+  # Every pod gets an IP from this range. Must not overlap with your real network.
   podSubnet: "{{ pod_network_cidr }}"
+
+  # serviceSubnet = the IP range for Services (stable endpoints to reach pods).
+  # {{ service_cidr }} = "10.96.0.0/12" from group_vars/all.yml
+  # Every Service gets an IP from this range. These are "virtual IPs" — they only exist
+  # inside the cluster's routing tables.
   serviceSubnet: "{{ service_cidr }}"
+
 apiServer:
   certSANs:
+    # certSANs = "Certificate Subject Alternative Names"
+    # The API server's TLS certificate must include every name/IP you might use to connect.
+    # If you connect from an IP not listed here, your kubectl will get an SSL error.
+    # The Ansible master role builds the _cert_sans list to include:
+    #   - The internal IP of the master
+    #   - 127.0.0.1 (loopback — for kubectl running directly on the master)
+    #   - localhost (hostname version of loopback)
+    #   - Any extra SANs from apiserver_extra_sans in group_vars
+    #   - The public IP (AWS only)
+    # {% for %} is a Jinja2 loop — it generates one "- <value>" line per item in the list.
 {% for san in _cert_sans %}
     - "{{ san }}"
 {% endfor %}
+
 ---
+# ── Section 3: KubeletConfiguration ─────────────────────────────────────
+# Settings for the kubelet agent running on the master.
+# (Workers get their kubelet config from the master after joining.)
+
 apiVersion: kubelet.config.k8s.io/v1beta1
-kind: KubeletConfiguration
+kind: KubeletConfiguration   # This is the "KubeletConfiguration" type.
+
+# cgroupDriver = which system manages CPU/memory limits for containers.
+# "systemd" = use systemd's cgroup management.
+# Why systemd? Modern Linux systems use systemd as the init system.
+# containerd is also configured to use systemd (SystemdCgroup = true in containerd config).
+# ALL THREE must agree: Linux systemd, containerd, and kubelet — all using "systemd".
+# Mixing cgroupfs and systemd causes mysterious resource limit failures.
 cgroupDriver: systemd

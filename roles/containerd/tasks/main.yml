@@ -1,118 +1,209 @@
 ---
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE: roles/containerd/tasks/main.yml
+# PURPOSE: Install and configure containerd — the container runtime.
+#
+# WHAT IS A CONTAINER RUNTIME?
+# Think of it as the engine that runs containers (mini-apps).
+# Kubernetes is the driver, containerd is the engine under the hood.
+# Without containerd, Kubernetes has no way to actually start or stop containers.
+#
+# WHY CONTAINERD AND NOT DOCKER?
+# Docker actually uses containerd internally. We install containerd directly
+# (without the full Docker overhead) because that's all Kubernetes needs.
+# Kubernetes dropped direct Docker support in v1.24 — containerd is the standard now.
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── Add Docker repo (containerd source) — Debian/Ubuntu ────────────────────
-# ansible_distribution gives 'Ubuntu' or 'Debian'; lower-case matches the repo path.
+# We get containerd from Docker's own package repository — it's the most up-to-date source.
+# Before adding the repo, we need its GPG key so apt can verify the packages are authentic.
+
+# Task: Download and save Docker's GPG signing key on Debian/Ubuntu.
+# GPG key = a cryptographic key. apt uses it to verify: "is this package really from Docker
+# and not tampered with by someone in the middle?" Without this, apt won't trust the repo.
 - name: Download Docker GPG key (Debian family)
   shell: |
+    # set -o pipefail = if any command in a pipe fails, the whole command fails.
+    # Without this, "curl fails | gpg succeeds" would look like overall success.
     set -o pipefail
+    # curl -fsSL = download the key file:
+    #   -f = fail silently on HTTP errors (don't save an error page as the key)
+    #   -s = silent (no progress bars)
+    #   -S = but DO show errors if they happen
+    #   -L = follow redirects (if the URL redirects to another URL, follow it)
+    # {{ ansible_distribution | lower }} = "ubuntu" or "debian" (lowercased)
+    #   This builds the correct URL for each OS, e.g. docker.com/linux/ubuntu/gpg
     curl -fsSL https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg \
+      # | gpg --dearmor = convert from ASCII-armored PGP format to binary format
+      # -o /usr/share/keyrings/docker-archive-keyring.gpg = save the binary key to this file
       | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
   args:
-    executable: /bin/bash
+    executable: /bin/bash   # Use bash to run this shell script (not sh — we need pipefail support)
     creates: /usr/share/keyrings/docker-archive-keyring.gpg
-  when: ansible_os_family == "Debian"
+    # creates = if this file already exists, SKIP this task (idempotent — safe to re-run)
+  when: ansible_os_family == "Debian"   # Only on Ubuntu/Debian
   tags: [containerd, packages]
 
+# Task: Add the Docker package repository to apt's source list on Debian/Ubuntu.
+# After this, "apt install containerd.io" knows WHERE to download it from.
 - name: Add Docker apt repository (Debian family)
-  apt_repository:
+  apt_repository:    # "apt_repository" module = add/remove software repositories
     repo: "deb [arch={{ deb_arch }} signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/{{ ansible_distribution | lower }} {{ ansible_distribution_release }} stable"
-    state: present
-    filename: docker
+    # Breaking down this repo line:
+    # deb                     = this is a Debian binary package repository
+    # [arch={{ deb_arch }}]   = only download packages for our architecture (amd64 or arm64)
+    # signed-by=...keyring.gpg = verify packages using the key we downloaded above
+    # https://download.docker.com/linux/ubuntu = the repo URL
+    # {{ ansible_distribution_release }} = Ubuntu release codename (e.g. "jammy" for 22.04)
+    # stable = the "stable" channel (not "test" or "nightly")
+    state: present    # Make sure this repo IS in apt's sources
+    filename: docker  # Save to /etc/apt/sources.list.d/docker.list
   when: ansible_os_family == "Debian"
   tags: [containerd, packages]
 
 # ── Add Docker repo — RedHat family ────────────────────────────────────────
-# RHEL 9 uses the 'rhel' repo path; Rocky/AlmaLinux/CentOS use 'centos'.
+
+# Task: Figure out the correct Docker repo URL for this RedHat-based OS.
+# Why? Docker has different repo URLs for RHEL vs Rocky/AlmaLinux/CentOS.
+# RHEL uses "rhel" in the URL path, others use "centos".
 - name: Set Docker yum repo base URL fact
   set_fact:
     _docker_yum_baseurl: "https://download.docker.com/linux/{{ 'rhel' if ansible_distribution == 'RedHat' else 'centos' }}/$releasever/$basearch/stable"
+    # ansible_distribution == 'RedHat' = true only for official RHEL, not Rocky or Alma
+    # 'rhel' if RedHat else 'centos'   = ternary (if/else) expression — picks the right URL segment
+    # $releasever = yum variable for the OS version (e.g. "9")
+    # $basearch   = yum variable for architecture (e.g. "x86_64")
+    # These $ variables are expanded by yum/dnf itself, not by Ansible
   when: ansible_os_family == "RedHat"
   tags: [containerd, packages]
 
+# Task: Add the Docker yum repository on RedHat-based systems.
 - name: Add Docker yum repository (RedHat family)
-  yum_repository:
-    name: docker-ce
-    description: Docker CE Stable
-    baseurl: "{{ _docker_yum_baseurl }}"
-    gpgcheck: true
+  yum_repository:           # "yum_repository" module = manage yum/dnf software repositories
+    name: docker-ce          # Internal repo name (used for commands like "yum list docker-ce")
+    description: Docker CE Stable   # Human-readable description
+    baseurl: "{{ _docker_yum_baseurl }}"   # URL of the repo (set in the previous task)
+    gpgcheck: true           # Verify downloaded packages with the GPG key (security check)
     gpgkey: "https://download.docker.com/linux/{{ 'rhel' if ansible_distribution == 'RedHat' else 'centos' }}/gpg"
-    enabled: true
+    # gpgkey = URL where yum can download the GPG key to verify packages
+    enabled: true            # Make this repo active (so yum/dnf will use it)
   when: ansible_os_family == "RedHat"
   tags: [containerd, packages]
 
 # ── Install containerd ─────────────────────────────────────────────────────
+
+# Task: Install containerd on Debian/Ubuntu.
+# "containerd.io" = the package name in Docker's repo (different from Ubuntu's built-in "containerd").
+# Why use Docker's version and not Ubuntu's? Docker's is newer and has all features Kubernetes needs.
 - name: Install containerd.io (Debian)
   apt:
-    name: containerd.io
-    state: present
-    update_cache: true
-    cache_valid_time: 3600
+    name: containerd.io    # Install this specific package from the Docker repo we just added
+    state: present          # Make sure it IS installed
+    update_cache: true      # Run "apt-get update" first to see the new Docker repo we just added
+    cache_valid_time: 3600  # Reuse cache if it's less than 1 hour old
   when: ansible_os_family == "Debian"
   tags: [containerd, packages]
 
+# Task: Install containerd on RedHat-based systems.
 - name: Install containerd.io (RedHat)
   yum:
-    name: containerd.io
+    name: containerd.io   # Same package name in the Docker yum repo
     state: present
   when: ansible_os_family == "RedHat"
   tags: [containerd, packages]
 
 # ── Configure containerd ───────────────────────────────────────────────────
+
+# Task: Create the directory where containerd stores its config.
+# It might already exist, but creating it here is safe — "state: directory" just
+# makes sure it exists without deleting anything inside it.
 - name: Create containerd config directory
   file:
-    path: "{{ containerd_config_dir }}"
-    state: directory
-    mode: "0755"
+    path: "{{ containerd_config_dir }}"   # /etc/containerd (from group_vars/all.yml)
+    state: directory   # Make sure this PATH is a DIRECTORY (create it if missing)
+    mode: "0755"       # Permissions: owner can read/write/execute; others can read/execute
   tags: [containerd, config]
 
+# Task: Create the certificate directory inside containerd's config folder.
+# certs.d = where containerd looks for custom registry certificates.
+# This allows pulling images from private registries with self-signed certificates.
 - name: Create containerd certs.d directory
   file:
-    path: "{{ containerd_config_dir }}/certs.d"
+    path: "{{ containerd_config_dir }}/certs.d"   # /etc/containerd/certs.d
     state: directory
     mode: "0755"
   tags: [containerd, config]
 
+# Task: Generate containerd's default configuration.
+# "containerd config default" = asks containerd to print its own default config.
+# We capture this output and use it as our starting point, then modify specific parts.
+# Why start from default? It includes all the right settings for our version of containerd.
 - name: Generate default containerd config
-  command: containerd config default
-  register: containerd_default_config
-  changed_when: false
+  command: containerd config default   # Run this command on the remote computer
+  register: containerd_default_config  # Save the output (stdout) into "containerd_default_config"
+  changed_when: false                  # This just reads/generates — it doesn't change anything on disk
   tags: [containerd, config]
 
+# Task: Write the generated default config to the actual config file.
+# containerd reads /etc/containerd/config.toml at startup.
+# TOML = "Tom's Obvious Minimal Language" — a config file format like INI but more structured.
 - name: Write containerd config
   copy:
-    content: "{{ containerd_default_config.stdout }}"
-    dest: "{{ containerd_config_dir }}/config.toml"
+    content: "{{ containerd_default_config.stdout }}"   # The output from the previous command
+    dest: "{{ containerd_config_dir }}/config.toml"     # Write it to /etc/containerd/config.toml
     mode: "0644"
-  notify: restart containerd
+  notify: restart containerd   # If this file changed, restart containerd at end of play
   tags: [containerd, config]
 
+# Task: Enable SystemdCgroup in containerd's config.
+# Cgroup = "control group" — Linux's way of limiting how much CPU/memory a process can use.
+# There are two ways to manage cgroups: cgroupfs (old way) and systemd (new way).
+# Kubernetes uses systemd to manage cgroups. If containerd uses cgroupfs, there's a conflict
+# where TWO things try to manage cgroups — chaos and crashes follow.
+# Setting SystemdCgroup = true = "use systemd to manage cgroups" = consistent with Kubernetes.
 - name: Enable SystemdCgroup
   replace:
-    path: "{{ containerd_config_dir }}/config.toml"
-    regexp: 'SystemdCgroup\s*=\s*false'
-    replace: 'SystemdCgroup = true'
-  notify: restart containerd
+    path: "{{ containerd_config_dir }}/config.toml"   # Modify the config we just wrote
+    regexp: 'SystemdCgroup\s*=\s*false'               # Find "SystemdCgroup = false" (with any whitespace)
+    replace: 'SystemdCgroup = true'                   # Replace with "SystemdCgroup = true"
+  notify: restart containerd   # Config changed → restart containerd when done
   tags: [containerd, config]
 
+# Task: Set the "pause" container image version to 3.10.
+# What is a pause container? Every Kubernetes pod has one "pause" container that:
+#   1. Holds the pod's network namespace (the pod's IP address "lives" in this container)
+#   2. Acts as the "parent" for all other containers in the pod
+# We pin it to 3.10 to match Kubernetes 1.36.x — mismatched versions cause subtle bugs.
 - name: Set pause image to 3.10
   replace:
     path: "{{ containerd_config_dir }}/config.toml"
-    regexp: '^\s*sandbox_image\s*=\s*".*"'
-    replace: '    sandbox_image = "registry.k8s.io/pause:3.10"'
+    regexp: '^\s*sandbox_image\s*=\s*".*"'            # Find any line setting sandbox_image to any value
+    replace: '    sandbox_image = "registry.k8s.io/pause:3.10"'   # Replace with the exact version we want
+    # registry.k8s.io = the official Kubernetes container image registry
+    # pause:3.10       = the pause container image at version 3.10
   notify: restart containerd
   tags: [containerd, config]
 
+# Task: Tell containerd where to find custom certificate configs for image registries.
+# config_path = a directory containerd checks for per-registry certificate overrides.
+# Without this, containerd doesn't know about the /etc/containerd/certs.d/ folder we created.
+# Setting config_path activates that directory so custom registry certs will be respected.
 - name: Set config_path for registry certs
   replace:
     path: "{{ containerd_config_dir }}/config.toml"
-    regexp: '^\s*config_path\s*=\s*""'
-    replace: '      config_path = "/etc/containerd/certs.d"'
+    regexp: '^\s*config_path\s*=\s*""'                   # Find the empty config_path = ""
+    replace: '      config_path = "/etc/containerd/certs.d"'   # Point it to our certs directory
   notify: restart containerd
   tags: [containerd, config]
 
 # ── Enable containerd ──────────────────────────────────────────────────────
+
+# Task: Start containerd and make sure it starts automatically on reboot.
+# This is the final step — once containerd is running and enabled,
+# Kubernetes can use it to start and stop containers.
 - name: Enable and start containerd
   service:
-    name: containerd
-    state: started
-    enabled: true
+    name: containerd   # The containerd service
+    state: started     # Start it right now if not running
+    enabled: true      # Make it start automatically when the computer reboots
   tags: [containerd]

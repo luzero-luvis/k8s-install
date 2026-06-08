@@ -1,6 +1,38 @@
 ---
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE: requirements.yml
+# PURPOSE: The SHOPPING LIST of extra Ansible tools (collections) to download
+# before running this playbook.
+#
+# Ansible "collections" = bundles of extra modules, plugins, and roles that extend
+# what Ansible can do. Like installing pip packages for Python.
+#
+# HOW TO INSTALL THESE:
+#   ansible-galaxy collection install -r requirements.yml
+#
+# Run this ONCE before your first "ansible-playbook" run. After that, the
+# collections are cached locally and you don't need to re-download.
+# ─────────────────────────────────────────────────────────────────────────────
+
 collections:
-  - name: ansible.posix       # sysctl, firewalld, authorized_key
+  # ansible.posix = the POSIX (Linux/Unix) collection from the official Ansible team.
+  # "posix" = Portable Operating System Interface — the standard Unix interface.
+  # This collection provides modules for Linux-specific things:
+  #   - ansible.posix.sysctl    → set kernel parameters (used in common role)
+  #   - ansible.posix.firewalld → manage firewalld rules (used in common role)
+  #   - ansible.posix.selinux   → manage SELinux mode (used in common role)
+  #   - ansible.posix.authorized_key → manage SSH keys
+  # ">=1.5" = install version 1.5 or newer (so we get all needed features but allow updates)
+  - name: ansible.posix
     version: ">=1.5"
-  - name: community.general   # dpkg_selections, timezone, modprobe, hostname
+
+  # community.general = the "catch-all" community collection with hundreds of modules.
+  # Maintained by the Ansible community (not the core Ansible team).
+  # This collection provides:
+  #   - community.general.dpkg_selections → lock/hold package versions on Debian (used in kubernetes role)
+  #   - community.general.timezone        → set timezone (used in common role)
+  #   - community.general.modprobe        → load kernel modules (used in common role)
+  #   - community.general.ufw             → manage ufw firewall on Ubuntu/Debian (used in common role)
+  # ">=8.0" = install version 8.0 or newer
+  - name: community.general
     version: ">=8.0"

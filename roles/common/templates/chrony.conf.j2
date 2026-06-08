@@ -1,9 +1,57 @@
-# Managed by Ansible
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE: roles/common/templates/chrony.conf.j2
+# PURPOSE: Configuration for chrony — the time synchronization service.
+# Chrony keeps all computers' clocks synchronized with internet time servers.
+#
+# WHY CLOCK SYNC MATTERS FOR KUBERNETES:
+# - TLS certificates have expiry times — if clock is wrong, valid certs look expired
+# - Bootstrap tokens expire (kubeadm_token_ttl) — wrong clock = tokens appear expired
+# - Log correlation across servers is impossible if timestamps are different
+# - etcd (the cluster database) uses timestamps for conflict resolution
+#
+# This is a Jinja2 template (.j2). Ansible fills in {{ variables }} before copying.
+# The final file is written to /etc/chrony.conf on each computer.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Managed by Ansible — this comment appears in the final file as a reminder
+# not to manually edit it (changes will be overwritten on next playbook run).
+
+# ── Time servers ─────────────────────────────────────────────────────────
+# "server" = a time server to sync with.
+# {{ server }} = filled in by Ansible from the ntp_servers list in group_vars/all.yml.
+# "iburst" = on startup, send several requests quickly to sync the clock fast.
+#            Without iburst, initial sync takes up to 30 minutes. With it: seconds.
+# {% for %} loop = one "server" line per entry in the ntp_servers list.
 {% for server in ntp_servers %}
 server {{ server }} iburst
 {% endfor %}
 
+# ── Clock drift ───────────────────────────────────────────────────────────
+# driftfile = where chrony records how fast/slow the computer's hardware clock is.
+# Every real clock runs slightly fast or slow. Chrony measures this "drift" and
+# corrects for it so the clock stays accurate even without internet access temporarily.
 driftfile /var/lib/chrony/drift
+
+# ── Clock step ────────────────────────────────────────────────────────────
+# makestep = controls how chrony corrects a clock that is very wrong.
+# "1.0 3" means:
+#   1.0 = if the clock is off by more than 1 second...
+#   3   = ...during the first 3 clock updates after startup...
+#         ...step the clock instantly (jump to correct time) instead of slewing.
+# "Stepping" = jumping the clock directly to the correct time (instant but jarring).
+# "Slewing"  = gradually adjusting the clock (smooth but slow for large offsets).
+# Why step during startup? If a server rebooted and the clock is an hour wrong,
+# slewing would take hours to correct it. Stepping fixes it in milliseconds.
 makestep 1.0 3
+
+# ── Hardware clock sync ───────────────────────────────────────────────────
+# rtcsync = periodically sync the hardware clock (CMOS/RTC) with the system clock.
+# The RTC = the battery-powered clock on the motherboard that keeps time when powered off.
+# Without rtcsync, after a reboot the computer starts with the old (potentially wrong) RTC time.
+# With rtcsync, the RTC stays up-to-date so reboots don't cause clock jumps.
 rtcsync
+
+# ── Logging ───────────────────────────────────────────────────────────────
+# logdir = where chrony writes its log files.
+# Useful for debugging time sync issues — check here if you suspect clock problems.
 logdir /var/log/chrony

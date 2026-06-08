@@ -1,68 +1,118 @@
 ---
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE: roles/kubernetes/tasks/main.yml
+# PURPOSE: Install the three core Kubernetes command-line tools on every computer.
+#
+# THREE TOOLS WE INSTALL:
+# 1. kubelet   = the Kubernetes AGENT that runs on every computer.
+#                It receives instructions from the master and starts/stops containers.
+#                Always running as a system service.
+# 2. kubeadm   = the SETUP TOOL used to initialize the cluster and join nodes.
+#                Only used during setup, but must be installed everywhere.
+# 3. kubectl   = the CONTROL TOOL — command-line interface to talk to Kubernetes.
+#                Lets you type commands like "kubectl get pods" to see what's running.
+#
+# IMPORTANT: We PIN (lock) these versions so they never auto-update.
+# Why? Accidental version upgrades break clusters. Always upgrade Kubernetes intentionally.
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── Debian / Ubuntu ────────────────────────────────────────────────────────
+
+# Task: Create the /etc/apt/keyrings directory if it doesn't exist.
+# "keyrings" = where apt stores trusted GPG keys for package repos.
+# This directory was introduced in newer Debian/Ubuntu versions — may not exist by default.
 - name: Create apt keyrings directory
   file:
-    path: /etc/apt/keyrings
-    state: directory
-    mode: "0755"
+    path: /etc/apt/keyrings   # The directory to create
+    state: directory           # Make sure this path IS a directory
+    mode: "0755"               # Readable and executable by everyone, writable only by owner (root)
   when: ansible_os_family == "Debian"
   tags: [kubernetes, packages]
 
+# Task: Download the Kubernetes GPG signing key on Debian/Ubuntu.
+# Same concept as the Docker GPG key — apt needs this to verify Kubernetes packages are authentic.
+# The key is specific to the minor version (1.36) — different k8s versions use different keys.
 - name: Download Kubernetes apt GPG key
   shell: |
+    # set -o pipefail = fail the whole command if any step in the pipe fails
     set -o pipefail
+    # curl -fsSL = download silently, follow redirects, fail on HTTP errors
+    # kubernetes_repo_version = "1.36" (calculated in group_vars/all.yml from "1.36.1")
+    # This builds the URL: https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key
     curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_repo_version }}/deb/Release.key \
+      # | gpg --dearmor = convert ASCII key to binary format
+      # -o {{ kubernetes_apt_keyring_path }} = save to /etc/apt/keyrings/kubernetes-apt-keyring.gpg
       | gpg --dearmor -o {{ kubernetes_apt_keyring_path }}
   args:
     executable: /bin/bash
-    creates: "{{ kubernetes_apt_keyring_path }}"
+    creates: "{{ kubernetes_apt_keyring_path }}"   # Skip if key file already exists (idempotent)
   when: ansible_os_family == "Debian"
   tags: [kubernetes, packages]
 
+# Task: Add the Kubernetes apt repository to Debian/Ubuntu.
+# This tells apt "go to this URL when I ask for kubernetes packages".
 - name: Add Kubernetes apt repository
   apt_repository:
     repo: "deb [signed-by={{ kubernetes_apt_keyring_path }}] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_repo_version }}/deb/ /"
-    state: present
-    filename: kubernetes
+    # Breaking this down:
+    # deb               = binary package repository format
+    # signed-by=...gpg  = verify packages using the key we downloaded
+    # https://pkgs.k8s.io/core:/stable:/v1.36/deb/ = the Kubernetes official repo for version 1.36
+    # /                 = the component (just "/" for the community repos — means "root component")
+    state: present      # Make sure this repo is registered with apt
+    filename: kubernetes  # Save to /etc/apt/sources.list.d/kubernetes.list
   when: ansible_os_family == "Debian"
   tags: [kubernetes, packages]
 
+# Task: Install kubelet, kubeadm, and kubectl on Debian/Ubuntu.
 - name: Install kubeadm, kubelet, kubectl (Debian)
   apt:
     name:
-      - kubelet
-      - kubeadm
-      - kubectl
-    state: present
-    update_cache: true
+      - kubelet   # The node agent — MUST be installed on every computer
+      - kubeadm   # The cluster setup tool — used during init and join
+      - kubectl   # The command-line control tool
+    state: present      # Make sure all three are installed
+    update_cache: true  # Run apt-get update first to see the k8s repo we just added
     cache_valid_time: 3600
   when: ansible_os_family == "Debian"
   tags: [kubernetes, packages]
 
+# Task: LOCK (hold) the kubernetes packages so they don't auto-update.
+# Why? "apt upgrade" would upgrade kubelet/kubeadm/kubectl to the next version.
+# Kubernetes version upgrades require a specific process — you can't just bump versions.
+# "hold" = apt will not update these packages unless you explicitly unhold them first.
 - name: Hold kubeadm, kubelet, kubectl at current version
-  ansible.builtin.dpkg_selections:
-    name: "{{ item }}"
-    selection: hold
+  ansible.builtin.dpkg_selections:   # dpkg_selections = the module to set apt package hold status
+    name: "{{ item }}"    # Package name (from the loop below)
+    selection: hold        # "hold" = prevent automatic updates
   loop:
-    - kubelet
-    - kubeadm
-    - kubectl
+    - kubelet    # Lock kubelet version
+    - kubeadm   # Lock kubeadm version
+    - kubectl    # Lock kubectl version
   when: ansible_os_family == "Debian"
   tags: [kubernetes, packages]
 
 # ── RedHat / CentOS / Fedora ────────────────────────────────────────────────
+
+# Task: Add the Kubernetes yum repository on RedHat-based systems.
 - name: Add Kubernetes yum repository
   yum_repository:
-    name: kubernetes
-    description: "Kubernetes v{{ kubernetes_version }}"
+    name: kubernetes          # Internal repo name
+    description: "Kubernetes v{{ kubernetes_version }}"   # Human-readable: "Kubernetes v1.36.1"
     baseurl: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_repo_version }}/rpm/"
-    gpgcheck: true
+    # The Kubernetes official RPM repo URL for version 1.36
+    gpgcheck: true            # Verify packages with GPG key
     gpgkey: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_repo_version }}/rpm/repodata/repomd.xml.key"
-    enabled: true
+    # URL to download the GPG key for this repo
+    enabled: true             # Activate this repo
     exclude: "kubelet kubeadm kubectl cri-tools kubernetes-cni"
+    # exclude = tell yum to NEVER install these packages from OTHER repos.
+    # Why? Some other repos (like EPEL) also have kubernetes packages but wrong/old versions.
+    # This forces yum to only ever get these packages from the kubernetes repo we just added.
   when: ansible_os_family == "RedHat"
   tags: [kubernetes, packages]
 
+# Task: Install kubelet, kubeadm, kubectl on RedHat-based systems.
 - name: Install kubeadm, kubelet, kubectl (RedHat)
   yum:
     name:
@@ -71,28 +121,48 @@
       - kubectl
     state: present
     disable_excludes: kubernetes
+    # disable_excludes: kubernetes = temporarily ignore the "exclude" rule we set in the repo above.
+    # Without this, yum would refuse to install from the kubernetes repo because of the exclude list.
+    # This says "for this install command, ignore the exclusion rule and install from kubernetes repo".
   when: ansible_os_family == "RedHat"
   tags: [kubernetes, packages]
 
+# Task: Install the dnf versionlock plugin on RedHat systems.
+# dnf = the modern package manager on RedHat 8+ (replaces yum).
+# "versionlock" = a dnf plugin that "locks" specific packages at their current version.
+# This is the RedHat equivalent of apt's "hold" command.
 - name: Install dnf versionlock plugin (RedHat)
   yum:
-    name: python3-dnf-plugin-versionlock
-    state: present
+    name: python3-dnf-plugin-versionlock   # The versionlock plugin package
+    state: present                          # Make sure it's installed
   when: ansible_os_family == "RedHat"
   tags: [kubernetes, packages]
 
+# Task: Lock kubelet, kubeadm, kubectl at their current versions on RedHat.
+# Works like apt's "hold" — prevents accidental version upgrades.
 - name: Lock kubelet, kubeadm, kubectl versions (RedHat)
   command: dnf versionlock add kubelet kubeadm kubectl
+  # dnf versionlock add = add these packages to the locked list
+  # After this, "dnf update" will skip these packages
   when: ansible_os_family == "RedHat"
-  register: versionlock_result
+  register: versionlock_result   # Save output so we can check what happened
   changed_when: "'Added' in versionlock_result.stdout"
+  # changed_when = only mark this as "changed" if the output says "Added"
+  # (If they were already locked, output says "already locked" → not a change)
   failed_when: versionlock_result.rc != 0 and 'already locked' not in versionlock_result.stdout
+  # failed_when = fail IF: the command returned a non-zero exit code AND it's not the "already locked" message
+  # Why? "already locked" returns rc=1 but isn't really an error — the lock is already in place.
   tags: [kubernetes, packages]
 
 # ── Common ──────────────────────────────────────────────────────────────────
+
+# Task: Start kubelet and enable it to start at boot on ALL computers.
+# kubelet is the kubernetes agent — it must ALWAYS be running on every node.
+# Note: kubelet will actually fail/crash-loop until kubeadm init or kubeadm join runs.
+# That's normal — kubelet waits for the cluster to be initialized.
 - name: Enable and start kubelet
   service:
-    name: kubelet
-    state: started
-    enabled: true
+    name: kubelet       # The kubelet system service
+    state: started      # Start it right now
+    enabled: true       # Enable it to start automatically on reboot
   tags: [kubernetes]

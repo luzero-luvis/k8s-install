@@ -1,87 +1,155 @@
 ---
-# Tear down the cluster and reset all nodes to a clean state.
-# Usage: ansible-playbook -i inventory/<cloud|onprem>.ini reset.yml
-# WARNING: this is destructive and irreversible.
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE: reset.yml
+# PURPOSE: THE UNDO BUTTON — tear down the entire Kubernetes cluster and return
+# every computer to a clean state, as if Kubernetes was never installed.
+#
+# WARNING: THIS IS DESTRUCTIVE AND IRREVERSIBLE.
+# Running this will DELETE ALL YOUR KUBERNETES DATA including:
+#   - All running pods and containers
+#   - All services, deployments, and config maps
+#   - The etcd database (all cluster state)
+#   - TLS certificates
+#   - Cilium networking (all virtual network interfaces)
+#
+# HOW TO RUN:
+#   ansible-playbook -i inventory/onprem.ini reset.yml
+# ─────────────────────────────────────────────────────────────────────────────
 
+# ═════════════════════════════════════════════════════════════════════════════
+# PLAY 1: Reset every computer in the cluster
+# ═════════════════════════════════════════════════════════════════════════════
 - name: Reset all Kubernetes nodes
-  hosts: k8s_cluster
-  become: true
-  gather_facts: false
+  hosts: k8s_cluster     # Run on ALL computers (masters + workers)
+  become: true           # Use sudo (need root to delete system files)
+  gather_facts: false    # Don't collect system info — we're destroying things, not building
   tasks:
+
+    # Task: Run kubeadm's built-in reset command.
+    # "kubeadm reset" is designed specifically for this — it:
+    #   - Stops kubelet
+    #   - Removes all kubeadm-managed config files
+    #   - Removes TLS certificates
+    #   - Removes etcd data (on master)
+    #   - Tears down the Kubernetes control plane (on master)
     - name: Run kubeadm reset
       command: kubeadm reset -f
-      failed_when: false
-      changed_when: false
+      # -f = force (don't ask "are you sure?") — needed for automation
+      failed_when: false    # Don't fail if kubeadm isn't installed or already reset
+      changed_when: false   # Don't mark as "changed" — this is expected cleanup
 
+    # Task: Wait for the computer to stabilize after the reset.
+    # kubeadm reset can temporarily break network connectivity (removes virtual interfaces).
+    # We wait for SSH to come back before continuing with more cleanup.
     - name: Wait for node to stabilise after kubeadm reset
-      wait_for_connection:
-        timeout: 60
-        sleep: 5
+      wait_for_connection:   # "wait_for_connection" = keep trying to reconnect via SSH
+        timeout: 60          # Give up after 60 seconds if SSH doesn't come back
+        sleep: 5             # Try reconnecting every 5 seconds
 
+    # Task: Remove the CNI (Container Network Interface) configuration.
+    # /etc/cni/ = where container network plugins store their configs.
+    # Leftover CNI config can cause new network setups to malfunction.
+    # We delete the whole directory because different CNIs use different subdirectories.
     - name: Remove CNI config
       file:
-        path: /etc/cni
-        state: absent
+        path: /etc/cni   # The CNI configuration directory
+        state: absent    # "absent" = delete this path (and everything inside it)
 
+    # Task: Remove the .kube directories from both root and ansible user.
+    # ~/.kube/config = the kubeconfig file (credentials for kubectl).
+    # After reset, the cluster is gone — these credentials are useless and confusing.
     - name: Remove .kube directories
       file:
-        path: "{{ item }}"
+        path: "{{ item }}"   # Path to remove (from the loop)
         state: absent
       loop:
-        - /root/.kube
-        - "/home/{{ ansible_user }}/.kube"
+        - /root/.kube                      # root user's kubeconfig directory
+        - "/home/{{ ansible_user }}/.kube" # ansible user's kubeconfig directory
 
+    # Task: Remove the Kubernetes package repository and GPG key on Debian/Ubuntu.
+    # After reset you might want to reinstall Kubernetes later.
+    # Keeping these repo files around can cause version conflicts.
+    # ignore_errors: true = these files might not exist — that's fine, don't fail.
     - name: Remove Kubernetes apt repo and keyring (Debian)
       file:
         path: "{{ item }}"
         state: absent
       loop:
-        - /etc/apt/sources.list.d/kubernetes.list
-        - /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-      ignore_errors: true
+        - /etc/apt/sources.list.d/kubernetes.list          # The kubernetes apt source file
+        - /etc/apt/keyrings/kubernetes-apt-keyring.gpg     # The kubernetes GPG signing key
+      ignore_errors: true   # Don't fail if these files don't exist (e.g. on RedHat systems)
 
+    # Task: Remove the kubeadm init config file from the master.
+    # This config file was written by the master role.
+    # Removing it ensures a clean state for if you re-run the installation.
     - name: Remove kubeadm init config
       file:
         path: /etc/kubernetes/kubeadm-init.yaml
         state: absent
 
+    # Task: Remove the Cilium Helm release from the master.
+    # "helm uninstall" = remove all Kubernetes resources that Cilium's Helm chart created.
+    # This deletes Cilium's DaemonSets, ConfigMaps, CRDs, etc. from the cluster.
+    # Note: this runs BEFORE kubeadm reset fully takes down the cluster.
     - name: Remove Cilium Helm release (master only)
       command: helm uninstall cilium -n kube-system
-      failed_when: false
+      # uninstall cilium = remove the Helm release named "cilium"
+      # -n kube-system   = from the kube-system namespace
+      failed_when: false    # Don't fail if Cilium was never installed
       changed_when: false
       environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
-      when: inventory_hostname in groups['masters']
+        KUBECONFIG: /etc/kubernetes/admin.conf   # Use master's credentials for helm
+      when: inventory_hostname in groups['masters']   # Only run on master computers
 
+    # Task: Delete Cilium's virtual network interfaces and clean up routes.
+    # Cilium creates virtual network interfaces (fake network cards) for its overlay network.
+    # Even after kubeadm reset, these interfaces remain — they can cause network problems.
+    # Example problem: leftover Cilium routes might hijack traffic to your real network.
     - name: Remove Cilium virtual interfaces and stale routes
       shell: |
         # Delete Cilium virtual interfaces — these inject routes that can
         # hijack traffic to the real host subnet if pod CIDR overlaps with VPC.
+        # Loop through each known Cilium interface name and delete it.
+        # "2>/dev/null || true" = ignore errors if the interface doesn't exist
         for iface in cilium_host cilium_net cilium_vxlan cilium_geneve lxc_health; do
           ip link del "$iface" 2>/dev/null || true
         done
-        # Remove any lxc* interfaces left by Cilium endpoint management
+
+        # Remove any lxc* interfaces left by Cilium endpoint management.
+        # lxc* interfaces = one created per pod endpoint by Cilium.
+        # "ip -o link show" = list all interfaces
+        # "awk -F': ' '{print $2}'" = extract just the interface name
+        # "grep '^lxc'" = only keep interfaces starting with "lxc"
         for iface in $(ip -o link show | awk -F': ' '{print $2}' | grep '^lxc'); do
           ip link del "$iface" 2>/dev/null || true
         done
-        # Flush routes added by Cilium (anything via cilium_host is now gone)
+
+        # Flush routes added by Cilium (anything via cilium_host is now gone).
+        # "proto kernel" = routes added by the kernel (including those Cilium programmed)
         ip route flush proto kernel 2>/dev/null || true
       args:
-        executable: /bin/bash
-      failed_when: false
+        executable: /bin/bash   # Use bash (not sh) — the loop syntax needs bash
+      failed_when: false        # Don't fail if interfaces are already gone
       changed_when: false
 
+    # Task: Reset ALL firewall (iptables) rules to a clean state.
+    # Kubernetes and Cilium add many iptables rules during operation.
+    # These rules can block or redirect traffic if left behind after reset.
+    # This task completely wipes all iptables rules and resets to "allow everything".
     - name: Flush iptables and ip6tables rules
       shell: |
-        iptables -P INPUT ACCEPT
-        iptables -P FORWARD ACCEPT
-        iptables -P OUTPUT ACCEPT
-        iptables -F
-        iptables -X
-        iptables -t nat -F
-        iptables -t nat -X
-        iptables -t mangle -F
-        iptables -t mangle -X
+        # IPv4 iptables reset:
+        iptables -P INPUT ACCEPT    # Set default INPUT policy to ACCEPT (allow all incoming)
+        iptables -P FORWARD ACCEPT  # Set default FORWARD policy to ACCEPT (allow all forwarded)
+        iptables -P OUTPUT ACCEPT   # Set default OUTPUT policy to ACCEPT (allow all outgoing)
+        iptables -F                 # Flush (delete) all rules in all chains
+        iptables -X                 # Delete all user-defined chains
+        iptables -t nat -F          # Flush all rules in the nat table (used for port forwarding/masquerade)
+        iptables -t nat -X          # Delete user-defined chains in nat table
+        iptables -t mangle -F       # Flush mangle table (used for packet marking)
+        iptables -t mangle -X       # Delete user-defined chains in mangle table
+
+        # IPv6 ip6tables reset (same operations but for IPv6 traffic):
         ip6tables -P INPUT ACCEPT
         ip6tables -P FORWARD ACCEPT
         ip6tables -P OUTPUT ACCEPT
@@ -93,19 +161,30 @@
         ip6tables -t mangle -X
       args:
         executable: /bin/bash
-      failed_when: false
+      failed_when: false    # Don't fail if iptables isn't installed
       changed_when: false
 
+    # Task: Restart containerd after the reset.
+    # containerd may have cached state about containers and images that no longer exist.
+    # Restarting it clears that in-memory state so it starts fresh.
+    # This also ensures containerd is healthy and ready for when you re-install Kubernetes.
     - name: Restart containerd
       service:
         name: containerd
-        state: restarted
+        state: restarted   # Restart = stop then start (not just start if stopped)
 
+# ═════════════════════════════════════════════════════════════════════════════
+# PLAY 2: Clean up the kubeconfig on YOUR LOCAL computer
+# ═════════════════════════════════════════════════════════════════════════════
 - name: Remove fetched kubeconfig from control machine
-  hosts: localhost
-  gather_facts: false
+  hosts: localhost       # Run on YOUR local computer (where Ansible is running from)
+  gather_facts: false    # Don't need system info for this simple file deletion
   tasks:
+
+    # Task: Delete the kubeconfig that was fetched from the master.
+    # The master role copied the kubeconfig to: <playbook_dir>/kubeconfig
+    # Since the cluster is destroyed, this file is useless and should be removed.
     - name: Remove local kubeconfig
       file:
-        path: "{{ playbook_dir }}/kubeconfig"
-        state: absent
+        path: "{{ playbook_dir }}/kubeconfig"   # The local kubeconfig file
+        state: absent                             # Delete it

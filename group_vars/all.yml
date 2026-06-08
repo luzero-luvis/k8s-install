@@ -1,38 +1,96 @@
 ---
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE: group_vars/all.yml
+# PURPOSE: The GLOBAL SETTINGS FILE — every variable (setting) defined here is
+# available to every single computer in your inventory.
+# Think of it as the "master settings panel" for the whole cluster.
+# You change a value here once, and it affects every playbook and every machine.
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ──────────────────────────────────────────────
 # Kubernetes version
 # ──────────────────────────────────────────────
+
+# kubernetes_version = the exact version of Kubernetes to install.
+# Like saying "install Windows 11.24H2" — be specific so all computers get the same version.
 kubernetes_version: "1.36.1"
+
+# kubernetes_repo_version = Ansible automatically calculates the MAJOR.MINOR part.
+# Example: "1.36.1" → splits by "." → takes first 2 parts → joins with "." → "1.36"
+# Why? Package repositories (download servers) are organized by major.minor, not patch version.
+# {{ }} means "evaluate this expression" — it's not a literal string, it's computed.
+# .split('.') = break "1.36.1" into ["1","36","1"]
+# [:2]        = take only the first 2 items → ["1","36"]
+# | join('.') = join them back with "." → "1.36"
 kubernetes_repo_version: "{{ kubernetes_version.split('.')[:2] | join('.') }}"
+
+# kubernetes_apt_keyring_path = where to store the security key (GPG key) for the
+# Kubernetes package repository on Debian/Ubuntu systems.
+# APT (the package manager) uses this key to verify downloads are authentic and not tampered with.
 kubernetes_apt_keyring_path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 
 # ──────────────────────────────────────────────
 # Containerd
 # ──────────────────────────────────────────────
+
+# containerd_config_dir = the folder where containerd stores its settings files.
+# Containerd is the "container runtime" — the engine that actually runs your mini-apps (containers).
+# Think of it like the engine under the hood of a car — Kubernetes is the driver, containerd is the engine.
 containerd_config_dir: /etc/containerd
 
 # ──────────────────────────────────────────────
 # Helm
 # ──────────────────────────────────────────────
+
+# helm_version = which version of Helm to install.
+# Helm is a "package manager for Kubernetes" — like apt/yum but for Kubernetes apps.
+# Instead of typing 100 kubectl commands to install an app, Helm does it with one command.
 helm_version: "3.17.3"
 
 # ──────────────────────────────────────────────
 # Architecture mapping (ansible_architecture → apt/docker arch)
 # ──────────────────────────────────────────────
+
+# arch_map = a lookup table that translates Linux architecture names to package repo names.
+# Why? Linux calls it "x86_64" but Docker/Kubernetes package repos call it "amd64".
+# This mapping lets us use the right name when building download URLs.
+# ansible_architecture = what Linux reports (x86_64 or aarch64)
+# amd64 / arm64        = what package repos use in their download URLs
 arch_map:
-  x86_64: amd64
-  aarch64: arm64
+  x86_64: amd64    # Standard Intel/AMD 64-bit computers → "amd64" in package repos
+  aarch64: arm64   # ARM 64-bit computers (like Raspberry Pi, Apple M1 servers) → "arm64"
 
 # ──────────────────────────────────────────────
 # Pod & Service networking — Cilium
 # ──────────────────────────────────────────────
-# IMPORTANT: must not overlap with your host network or VPC CIDR.
-# 10.244.0.0/16 is the standard k8s default — change if your LAN uses that range.
+
+# pod_network_cidr = the range of IP addresses reserved for PODS (mini-apps).
+# A CIDR is a block of IP addresses. "10.244.0.0/16" means:
+#   - Start at IP: 10.244.0.0
+#   - /16 = first 16 bits are fixed, last 16 bits are free → 65,536 available IPs
+# IMPORTANT: this range must NOT overlap with your real network (home/office IPs).
+# If your office uses 10.244.x.x already, change this to something else like 192.168.100.0/16.
 pod_network_cidr: "10.244.0.0/16"
+
+# service_cidr = the range of IP addresses reserved for SERVICES.
+# A Service in Kubernetes is a stable address you use to reach a group of pods.
+# Pods come and go (their IPs change), but a Service IP stays the same.
+# "10.96.0.0/12" = a range of about 1 million IPs for services.
 service_cidr: "10.96.0.0/12"
 
+# cilium_version = which version of Cilium to install.
+# Cilium is the NETWORKING BRAIN of the cluster — it connects all pods together,
+# enforces network security rules, and replaces the older kube-proxy component.
+# It uses a Linux technology called eBPF for very high-speed networking.
 cilium_version: "1.19.4"
+
+# cilium_helm_release = the name given to this Cilium installation inside Helm.
+# Like a nickname for the installed package so you can refer to it later (e.g., helm uninstall cilium).
 cilium_helm_release: cilium
+
+# cilium_helm_namespace = which Kubernetes "namespace" to install Cilium into.
+# A namespace is like a folder inside Kubernetes — it groups related things together.
+# "kube-system" = the reserved namespace for Kubernetes' own internal system components.
 cilium_helm_namespace: kube-system
 
 # ──────────────────────────────────────────────
@@ -40,42 +98,79 @@ cilium_helm_namespace: kube-system
 # Leave empty to auto-detect the master's primary IP.
 # Set explicitly for HA setups or load-balanced endpoints.
 # ──────────────────────────────────────────────
+
+# apiserver_advertise_address = the IP address the Kubernetes API server announces itself on.
+# Empty "" = Ansible will automatically figure out the master's main IP address.
+# Set this explicitly if you have multiple network cards and want to force a specific IP.
 apiserver_advertise_address: ""
+
+# apiserver_extra_sans = extra names/IPs to include in the API server's TLS certificate.
+# SAN = Subject Alternative Name — extra identities the certificate is valid for.
+# Example use case: add your load balancer IP so kubectl can connect through it.
+# Empty [] = no extra names, just use the auto-detected IP.
 apiserver_extra_sans: []
 
 # ──────────────────────────────────────────────
 # Join token TTL
 # ──────────────────────────────────────────────
+
+# kubeadm_token_ttl = how long the "join token" stays valid.
+# The join token is a temporary password that allows worker computers to join the cluster.
+# "24h" = the token expires after 24 hours. After that, workers can't join unless a new token is made.
+# This is a security feature — tokens shouldn't stay valid forever.
 kubeadm_token_ttl: "24h"
 
 # ──────────────────────────────────────────────
 # Environment-specific toggles
 # ──────────────────────────────────────────────
-# Cloud provider: aws | onprem
-# Controls kubelet provider-id, IMDSv2 metadata fetch.
+
+# cloud_provider = tells the playbook what kind of infrastructure you're running on.
+# "onprem" = your own physical/virtual computers (bare metal, VMware, Proxmox, etc.)
+# "aws"    = Amazon Web Services cloud computers (EC2 instances)
+# This switch enables/disables AWS-specific steps like fetching metadata from IMDSv2.
 cloud_provider: onprem
 
-# true  — Ansible does not touch the firewall (default).
-#         Use this when firewall rules are managed externally (cloud SGs, on-prem
-#         corporate firewall, or no firewall at all).
-# false — Ansible opens required K8s ports via firewalld (RHEL) or ufw (Debian).
-#         Only enable this if you want Ansible to manage host-level firewall rules.
+# disable_host_firewall = should Ansible turn OFF the computer's built-in firewall?
+# true  = YES, turn off the firewall. Use this when:
+#         - You're on AWS and Security Groups already handle traffic filtering
+#         - Your network has an external firewall
+#         - You just want to get started quickly without firewall complexity
+# false = NO, keep the firewall ON and let Ansible open the specific ports Kubernetes needs.
+#         Use this for production on-prem setups where you want host-level security.
 disable_host_firewall: true
 
-# Override the IP advertised to Kubernetes if a node has multiple NICs.
-# Defaults to the primary IPv4 address detected by Ansible.
-# Set per-host in inventory: node_ip=192.168.10.5
+# node_ip = the IP address each computer uses to identify itself to Kubernetes.
+# "{{ ansible_default_ipv4.address }}" = automatically use the computer's main network IP.
+# Why set this? If a computer has multiple network cards (NICs), Kubernetes might pick
+# the wrong one. This makes sure it always uses the right interface.
+# Override per-computer in inventory: "worker-1 ansible_host=... node_ip=10.0.0.5"
 node_ip: "{{ ansible_default_ipv4.address }}"
 
-# On-prem usually needs NTP; cloud VMs typically have it
+# configure_ntp = should Ansible set up time synchronization?
+# true  = YES — all computers' clocks will be synced to internet time servers.
+# Why does this matter? Kubernetes uses TLS certificates and tokens that expire by time.
+# If computers have different clocks (even by a few minutes), things break mysteriously.
 configure_ntp: true
+
+# ntp_servers = which time servers to sync clocks with.
+# These are free public NTP servers provided by the NTP Pool Project (pool.ntp.org).
+# Having 2 servers = if one is unreachable, fall back to the other.
 ntp_servers:
-  - "0.pool.ntp.org"
-  - "1.pool.ntp.org"
+  - "0.pool.ntp.org"   # Primary time server (the "0." means server pool #0)
+  - "1.pool.ntp.org"   # Backup time server (the "1." means server pool #1)
 
 # ──────────────────────────────────────────────
 # SELinux (RedHat on-prem only)
 # permissive: logs violations but does not block (recommended for k8s)
 # enforcing: fully enforced — requires additional policy tuning
 # ──────────────────────────────────────────────
+
+# selinux_state = how strict to make SELinux security on RedHat-based systems.
+# SELinux = Security-Enhanced Linux — a security system that controls what processes can do.
+# "permissive" = SELinux watches and logs what Kubernetes does but does NOT block anything.
+#                If Kubernetes tries to do something SELinux doesn't like, it gets a warning
+#                in the logs but is still allowed to proceed.
+# "enforcing"  = SELinux actively BLOCKS actions it doesn't approve of. Kubernetes needs
+#                special SELinux rules (policies) written for it — complex to set up correctly.
+# Recommendation: use "permissive" for Kubernetes — it's the industry standard approach.
 selinux_state: permissive

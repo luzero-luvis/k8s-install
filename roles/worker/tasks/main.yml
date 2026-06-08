@@ -1,56 +1,118 @@
 ---
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE: roles/worker/tasks/main.yml
+# PURPOSE: Connect (join) WORKER computers to the Kubernetes cluster.
+# This role ONLY runs on worker computers — the master must already be running.
+#
+# WHAT HAPPENS HERE:
+# 1. Verify the master gave us the join command (safety check)
+# 2. Check if this worker is already in the cluster
+# 3. Clean up any leftover state from a previous failed join
+# 4. Run the join command to connect this worker to the master
+# 5. Make sure kubelet is running
+# 6. Label the node as a "worker" in Kubernetes
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── Guard ─────────────────────────────────────────────────────────────────
+
+# Task: Make sure the master actually gave us a join command before we start.
+# Why? If the master play failed or was skipped, we won't have a join command.
+# Trying to join without it would fail with a confusing error.
+# This gives a CLEAR, helpful error message explaining exactly what went wrong.
 - name: Verify join command is available from master
   fail:
     msg: >
       kubeadm_join_command is not defined on {{ groups['masters'][0] }}.
       Make sure the master play completed successfully before running the worker play.
+      # groups['masters'][0] = the first (usually only) master computer's name
+      # This error means: "the master role didn't run, or it failed — fix that first"
   when: hostvars[groups['masters'][0]].kubeadm_join_command is not defined
+  # hostvars[groups['masters'][0]] = access variables that were set on the master computer
+  # .kubeadm_join_command           = the join command we saved in master/tasks/main.yml
+  # is not defined                  = if this variable doesn't exist → fail
   tags: [worker]
 
 # ── Join ──────────────────────────────────────────────────────────────────
+
+# Task: Check if this worker is ALREADY registered in the cluster.
+# Why? If we run the playbook again on a worker that already joined,
+# we don't want to try to join again (it would fail). Skip if already joined.
 - name: Check if node is registered in the current cluster
   command: kubectl get node {{ inventory_hostname }} --no-headers
+  # kubectl get node worker-1 = ask the cluster "is there a node called worker-1?"
+  # --no-headers = don't print column headers (we just care if it succeeds or fails)
   delegate_to: "{{ groups['masters'][0] }}"
+  # delegate_to = run this command ON THE MASTER computer (not on the worker).
+  # Why? Only the master has kubectl configured. Workers can't run kubectl themselves.
   environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  register: node_registered
-  changed_when: false
-  failed_when: false
+    KUBECONFIG: /etc/kubernetes/admin.conf   # Use the master's admin credentials
+  register: node_registered    # Save the result
+  # If node exists: rc=0 (success). If not: rc=1 (node not found).
+  changed_when: false           # Read-only — doesn't change anything
+  failed_when: false            # Don't fail if the node isn't found — that's the expected case
   tags: [worker]
 
+# Task: Clean up leftover Kubernetes files from a previous failed join attempt.
+# Why? If a previous "kubeadm join" partially ran and failed,
+# it may have left behind half-written config files and certificates.
+# "kubeadm join" refuses to run if these files exist (it thinks you're already joined).
+# We delete them so the join can start fresh.
 - name: Clean up stale kubelet state if node is not registered
   file:
-    path: "{{ item }}"
-    state: absent
+    path: "{{ item }}"   # File/directory to remove (from the loop)
+    state: absent         # "absent" = delete this if it exists, do nothing if it doesn't
   loop:
-    - /etc/kubernetes/kubelet.conf
-    - /etc/kubernetes/pki
-    - /var/lib/kubelet/config.yaml
-  when: node_registered.rc != 0
+    - /etc/kubernetes/kubelet.conf    # kubelet's connection config (written by kubeadm join)
+    - /etc/kubernetes/pki             # The certificates directory (created during join)
+    - /var/lib/kubelet/config.yaml    # kubelet's runtime config (written during join)
+  when: node_registered.rc != 0   # Only clean up if the node is NOT already in the cluster
   tags: [worker]
 
+# Task: Run the kubeadm join command to connect this worker to the cluster.
+# This is THE key moment for workers — after this, the worker becomes part of the cluster.
+# The join command:
+#   1. Downloads cluster info from the master
+#   2. Generates TLS certificates for this worker
+#   3. Registers the worker with the master
+#   4. Configures kubelet to talk to the master
 - name: Join cluster
   command: "{{ hostvars[groups['masters'][0]].kubeadm_join_command }}"
-  when: node_registered.rc != 0
-  changed_when: true
+  # hostvars[groups['masters'][0]].kubeadm_join_command = the join command we saved on the master
+  # It looks like: "kubeadm join 192.168.1.10:6443 --token abc123 --discovery-token-ca-cert-hash sha256:..."
+  when: node_registered.rc != 0   # Only join if NOT already in the cluster
+  changed_when: true               # This always changes something (joins a new node)
   tags: [worker]
 
+# Task: Make sure kubelet is running on this worker.
+# kubelet starts automatically during the join process, but this is a safety check.
+# If kubelet isn't running, the worker can't receive pod assignments from the master.
 - name: Ensure kubelet is running
   service:
-    name: kubelet
-    state: started
-    enabled: true
+    name: kubelet       # The Kubernetes node agent service
+    state: started      # Make sure it's running right now
+    enabled: true       # Make sure it starts automatically on reboot
   tags: [worker]
 
 # ── Label node ────────────────────────────────────────────────────────────
+
+# Task: Add a "worker" label to this node in Kubernetes.
+# Why? By default, kubeadm join creates nodes without a role label.
+# Kubectl shows the ROLES column as "<none>" which is confusing.
+# Adding this label makes the node show up as "worker" in "kubectl get nodes".
+# Labels are also used for node selectors — you can target pods to worker nodes specifically.
 - name: Label node as worker
   command: >
     kubectl label node {{ inventory_hostname }}
     node-role.kubernetes.io/worker=worker
     --overwrite
+    # kubectl label node worker-1 = add a label to the node named "worker-1"
+    # node-role.kubernetes.io/worker=worker = standard label key=value for worker role
+    #   The key "node-role.kubernetes.io/worker" is what kubectl uses to show the ROLES column
+    #   The value "worker" is just metadata
+    # --overwrite = if this label already exists, update it instead of failing
   delegate_to: "{{ groups['masters'][0] }}"
+  # Run on the master because only the master has kubectl access
   environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  changed_when: true
+    KUBECONFIG: /etc/kubernetes/admin.conf   # Master's admin credentials
+  changed_when: true   # Labels change node metadata — mark as changed
   tags: [worker]

@@ -1,38 +1,74 @@
 ---
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE: roles/master/tasks/main.yml
+# PURPOSE: Initialize the Kubernetes MASTER (control plane) computer.
+# This role ONLY runs on the master computer(s).
+#
+# WHAT HAPPENS HERE:
+# 1. Run "kubeadm init" to start the Kubernetes control plane
+# 2. Set up kubeconfig (credentials) so kubectl works
+# 3. Install Helm (the Kubernetes package manager)
+# 4. Install Cilium (the networking layer) via Helm
+# 5. Wait for everything to become healthy
+# 6. Generate a "join token" for workers to use
+# 7. Copy the kubeconfig to your local computer so you can use kubectl from there
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Task: Check if the cluster was ALREADY initialized before.
+# Why? kubeadm init fails if you run it twice. We check first, and only run it
+# if it hasn't been run yet. This makes the playbook safe to re-run (idempotent).
 - name: Check if cluster is already initialized
-  stat:
-    path: /etc/kubernetes/admin.conf
-  register: kubeadm_init_done
+  stat:                                  # "stat" module = get info about a file/directory
+    path: /etc/kubernetes/admin.conf     # This file is created by kubeadm init when it succeeds
+  register: kubeadm_init_done            # Save the result into "kubeadm_init_done"
+  # kubeadm_init_done.stat.exists = true if the file exists (cluster already initialized)
   tags: [master]
 
+# Task: Figure out which IP address the API server should listen on.
+# Why? If apiserver_advertise_address is empty in group_vars, auto-detect the master's main IP.
 - name: Detect primary IP if apiserver_advertise_address not set
   set_fact:
     _apiserver_ip: "{{ apiserver_advertise_address if apiserver_advertise_address else ansible_facts['default_ipv4']['address'] }}"
-  tags: [master, always]
+    # Ternary (if/else) logic:
+    # If apiserver_advertise_address is set (not empty) → use that value
+    # If it's empty → use ansible_facts['default_ipv4']['address'] (the computer's main IP)
+    # ansible_facts['default_ipv4']['address'] = auto-detected primary IP of this computer
+  tags: [master, always]   # "always" tag = also run even if other tags filter this task out
 
+# ── AWS-specific: Get the public IP for the API server TLS certificate ────
+
+# Task: Get an IMDSv2 security token from AWS (only on AWS).
+# On AWS, the API server TLS certificate needs to include the public IP so you can
+# connect to it from outside AWS (e.g., from your laptop via kubectl).
 - name: Fetch public IP via IMDSv2 token (AWS)
   uri:
-    url: http://169.254.169.254/latest/api/token
-    method: PUT
+    url: http://169.254.169.254/latest/api/token   # AWS magic IP — only works inside EC2
+    method: PUT           # IMDSv2 requires PUT (security measure against SSRF attacks)
     headers:
-      X-aws-ec2-metadata-token-ttl-seconds: "21600"
-    timeout: 5
-  register: _imds_token
-  when: cloud_provider == "aws"
-  failed_when: false
+      X-aws-ec2-metadata-token-ttl-seconds: "21600"   # Token valid for 6 hours
+    timeout: 5            # Give up after 5 seconds if not on AWS
+  register: _imds_token   # Save the token for the next task
+  when: cloud_provider == "aws"   # Only run on AWS
+  failed_when: false              # Don't crash if metadata server unreachable (on-prem)
   tags: [master]
 
+# Task: Use the IMDSv2 token to get this EC2 instance's public IP.
 - name: Fetch public IP from IMDSv2 (AWS)
   uri:
-    url: http://169.254.169.254/latest/meta-data/public-ipv4
+    url: http://169.254.169.254/latest/meta-data/public-ipv4   # Returns the public IP like "54.12.34.56"
     headers:
-      X-aws-ec2-metadata-token: "{{ _imds_token.content }}"
+      X-aws-ec2-metadata-token: "{{ _imds_token.content }}"    # Use the token from previous task
     timeout: 5
-  register: _master_public_ip
-  when: cloud_provider == "aws" and _imds_token is not failed
+  register: _master_public_ip   # Save the public IP for use in certSANs and kubeconfig patching
+  when: cloud_provider == "aws" and _imds_token is not failed   # Only if token fetch succeeded
   failed_when: false
   tags: [master]
 
+# Task: Build the list of names/IPs to include in the API server's TLS certificate.
+# certSANs = "Certificate Subject Alternative Names" — extra identities the cert covers.
+# Why? When you connect to the API server (kubectl), your computer verifies the TLS cert.
+# If your connection's destination IP/hostname isn't in the cert's SANs, SSL fails.
+# We add everything you might use to connect: internal IP, localhost, public IP, extras.
 - name: Build certSANs list
   set_fact:
     _cert_sans: >-
@@ -40,106 +76,166 @@
         ([_apiserver_ip, '127.0.0.1', 'localhost'] + apiserver_extra_sans)
         + ([_master_public_ip.content] if (cloud_provider == 'aws' and _master_public_ip is not failed and _master_public_ip.content is defined) else [])
       }}
+    # Breaking this down:
+    # [_apiserver_ip]         = the master's internal/private IP (always included)
+    # '127.0.0.1'             = loopback — so kubectl works FROM the master computer itself
+    # 'localhost'             = hostname version of loopback
+    # apiserver_extra_sans    = any extra names/IPs you added in group_vars/all.yml
+    # + [_master_public_ip]   = on AWS only, also add the public IP so kubectl works remotely
   tags: [master, always]
 
-# ── kubeadm init via config file (reproducible, diffable) ─────────────────
+# ── kubeadm init via config file ─────────────────────────────────────────
+
+# Task: Write the kubeadm initialization config file.
+# Instead of passing 20 flags on the command line, we use a config file.
+# This is more readable, version-controllable, and reproducible.
+# The .j2 extension = Jinja2 template — Ansible fills in {{ variables }} before copying.
 - name: Write kubeadm init config
   template:
-    src: kubeadm-init.yaml.j2
-    dest: /etc/kubernetes/kubeadm-init.yaml
-    mode: "0600"
+    src: kubeadm-init.yaml.j2       # Source template: roles/master/templates/kubeadm-init.yaml.j2
+    dest: /etc/kubernetes/kubeadm-init.yaml   # Write the filled-in file here on the master
+    mode: "0600"                    # Restrictive permissions — root read/write only (contains cluster config)
   tags: [master]
 
+# Task: Run kubeadm init to actually initialize the Kubernetes cluster.
+# This is THE key moment — running this command creates the entire Kubernetes control plane:
+#   - etcd (the cluster database)
+#   - kube-apiserver (the API server)
+#   - kube-controller-manager (keeps desired state)
+#   - kube-scheduler (decides where to run pods)
+# This command takes 2-5 minutes to complete.
 - name: Run kubeadm init
   command: kubeadm init --config /etc/kubernetes/kubeadm-init.yaml
-  when: not kubeadm_init_done.stat.exists
-  register: kubeadm_init_output
-  changed_when: kubeadm_init_output.rc == 0
+  # --config = use the config file we wrote in the previous task instead of command-line flags
+  when: not kubeadm_init_done.stat.exists   # ONLY run if the cluster hasn't been initialized yet
+  register: kubeadm_init_output    # Save the output (contains join command info, useful for debugging)
+  changed_when: kubeadm_init_output.rc == 0   # Mark as "changed" if the command succeeded (rc=0)
   tags: [master]
 
 # ── kubeconfig ────────────────────────────────────────────────────────────
+# kubeconfig = a file containing credentials and API server address for kubectl.
+# Think of it as a "login file" — kubectl reads it to know where to connect and as whom.
+
+# Task: Create the ~/.kube directory for the root user.
+# kubectl looks for its config at ~/.kube/config by default.
 - name: Create .kube directory for root
   file:
-    path: /root/.kube
-    state: directory
-    mode: "0700"
+    path: /root/.kube   # The .kube folder in root's home directory
+    state: directory     # Make sure it's a directory
+    mode: "0700"         # Only root can read/write/enter this directory (config has credentials)
   tags: [master]
 
+# Task: Copy the admin kubeconfig to root's home directory.
+# /etc/kubernetes/admin.conf = the kubeconfig created by kubeadm init (for cluster admin)
+# /root/.kube/config = where kubectl looks by default for the root user
 - name: Copy admin.conf to root kubeconfig
   copy:
-    src: /etc/kubernetes/admin.conf
-    dest: /root/.kube/config
-    remote_src: true
-    mode: "0600"
+    src: /etc/kubernetes/admin.conf   # Source file (on the master computer)
+    dest: /root/.kube/config          # Destination (also on the master computer)
+    remote_src: true    # remote_src: true = both src and dest are on the REMOTE computer, not local
+    mode: "0600"        # Only root can read this file (it contains cluster admin credentials)
   tags: [master]
 
+# Task: Create ~/.kube directory for the ansible user (non-root).
+# The ansible_user (e.g. "ansible") also needs kubectl access to run verification tasks.
 - name: Create .kube directory for ansible user
   file:
-    path: "/home/{{ ansible_user }}/.kube"
+    path: "/home/{{ ansible_user }}/.kube"   # /home/ansible/.kube (or whatever user you're using)
     state: directory
-    owner: "{{ ansible_user }}"
-    group: "{{ ansible_user }}"
+    owner: "{{ ansible_user }}"   # Set directory owner to the ansible user
+    group: "{{ ansible_user }}"   # Set directory group to the ansible user
     mode: "0700"
-  when: ansible_user != "root"
+  when: ansible_user != "root"   # Only needed if the ansible user isn't already root
   tags: [master]
 
+# Task: Copy the admin kubeconfig to the ansible user's home directory.
 - name: Copy admin.conf to ansible user kubeconfig
   copy:
     src: /etc/kubernetes/admin.conf
     dest: "/home/{{ ansible_user }}/.kube/config"
     remote_src: true
-    owner: "{{ ansible_user }}"
+    owner: "{{ ansible_user }}"   # File owned by ansible user (not root)
     group: "{{ ansible_user }}"
     mode: "0600"
   when: ansible_user != "root"
   tags: [master]
 
-# ── Helm (pinned version, checksum verified) ──────────────────────────────
+# ── Helm ──────────────────────────────────────────────────────────────────
+# Helm = the "package manager for Kubernetes" — like apt/yum but for Kubernetes apps.
+# We use Helm to install Cilium (networking). We pin the version for reproducibility.
+
+# Task: Check if Helm is already installed before downloading it again.
+# "helm version --short" prints the version if installed, or fails if not.
 - name: Check if Helm is already installed
-  command: helm version --short
-  register: helm_installed
-  changed_when: false
-  failed_when: false
+  command: helm version --short   # Returns something like "v3.17.3+g" if installed
+  register: helm_installed         # Save the result (success or failure)
+  changed_when: false              # Just checking — doesn't change anything
+  failed_when: false               # Don't fail the playbook if helm isn't installed yet
   tags: [master, helm]
 
+# Task: Download the Helm binary tarball (only if not already installed).
+# We also verify the checksum to make sure the download isn't corrupted or tampered with.
 - name: Download Helm tarball (with SHA256 checksum verification)
   get_url:
     url: "https://get.helm.sh/helm-v{{ helm_version }}-linux-{{ deb_arch }}.tar.gz"
-    dest: "/tmp/helm-v{{ helm_version }}.tar.gz"
+    # Example URL: https://get.helm.sh/helm-v3.17.3-linux-amd64.tar.gz
+    dest: "/tmp/helm-v{{ helm_version }}.tar.gz"   # Save to /tmp/ (temporary directory)
     checksum: "sha256:https://get.helm.sh/helm-v{{ helm_version }}-linux-{{ deb_arch }}.tar.gz.sha256sum"
+    # checksum = Ansible downloads the .sha256sum file and verifies our download matches.
+    # This protects against corrupted downloads AND supply-chain attacks (tampered binaries).
     mode: "0644"
-  when: helm_installed.rc != 0
+  when: helm_installed.rc != 0   # Only download if helm isn't already installed (rc != 0 = not found)
   tags: [master, helm]
 
+# Task: Extract the Helm binary from the downloaded tarball.
+# tar.gz = a compressed archive (like a .zip file). We need to extract the helm binary from inside it.
 - name: Extract Helm binary
   unarchive:
-    src: "/tmp/helm-v{{ helm_version }}.tar.gz"
-    dest: /tmp/
-    remote_src: true
-  when: helm_installed.rc != 0
+    src: "/tmp/helm-v{{ helm_version }}.tar.gz"   # The tarball we downloaded
+    dest: /tmp/                  # Extract it into /tmp/
+    remote_src: true             # The archive is on the remote computer, not on our local machine
+  when: helm_installed.rc != 0   # Only if helm wasn't already installed
   tags: [master, helm]
 
+# Task: Copy the helm binary to the system PATH.
+# After extraction, the helm binary is at /tmp/linux-amd64/helm
+# We copy it to /usr/local/bin/ so it's available as "helm" from anywhere.
 - name: Install Helm binary
   copy:
-    src: "/tmp/linux-{{ deb_arch }}/helm"
-    dest: /usr/local/bin/helm
-    remote_src: true
-    mode: "0755"
-    owner: root
-    group: root
+    src: "/tmp/linux-{{ deb_arch }}/helm"   # The extracted binary (e.g. /tmp/linux-amd64/helm)
+    dest: /usr/local/bin/helm               # Install to system PATH
+    remote_src: true    # Both source and destination are on the remote computer
+    mode: "0755"        # Executable by everyone (owner read/write/execute, others read/execute)
+    owner: root         # Owned by root
+    group: root         # Group root
   when: helm_installed.rc != 0
   tags: [master, helm]
 
 # ── Cilium CNI (OCI Helm, kube-proxy replacement) ────────────────────────
+# Cilium = the networking brain of the cluster.
+# CNI = Container Network Interface — the plugin that gives every pod an IP address
+# and lets pods talk to each other across different computers.
+# Without a CNI, pods stay in "Pending" state forever — they can't get an IP.
+# Cilium also replaces kube-proxy with a faster eBPF-based implementation.
+
+# Task: Check if Cilium is already installed before trying to install it again.
 - name: Check if Cilium is already installed
   command: helm status cilium -n kube-system
+  # helm status = check if a Helm release exists and is deployed
+  # cilium = the release name
+  # -n kube-system = look in the kube-system namespace
   environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
-  register: cilium_status
-  changed_when: false
-  failed_when: false
+    KUBECONFIG: /etc/kubernetes/admin.conf   # Use master's admin credentials for helm/kubectl
+  register: cilium_status     # Save the result
+  changed_when: false         # Read-only
+  failed_when: false          # Don't fail if Cilium isn't installed yet (expected first run)
   tags: [master, cilium]
 
+# Task: Install Cilium via Helm.
+# This runs ONE helm install command that:
+#   1. Downloads the Cilium Helm chart from quay.io
+#   2. Creates all the Kubernetes resources (DaemonSets, ConfigMaps, etc.) for Cilium
+#   3. Cilium pods start up and begin managing networking
 - name: Install Cilium
   command: >
     helm install {{ cilium_helm_release }}
@@ -151,68 +247,110 @@
     --set k8sServicePort=6443
     --set ipam.mode=cluster-pool
     --set ipam.operator.clusterPoolIPv4PodCIDRList={{ pod_network_cidr }}
+    # Breaking down the flags:
+    # helm install cilium          = create a new Helm release named "cilium"
+    # oci://quay.io/...            = download chart from OCI (container) registry at quay.io
+    # --version 1.19.4             = install exactly this Cilium version
+    # --namespace kube-system      = install into the kube-system namespace
+    # --set kubeProxyReplacement=true  = replace kube-proxy entirely with Cilium's eBPF implementation
+    #                                    (faster, uses less CPU/memory)
+    # --set k8sServiceHost=<ip>    = tell Cilium which IP the Kubernetes API server is on
+    # --set k8sServicePort=6443    = tell Cilium the API server's port (6443 is always the default)
+    # --set ipam.mode=cluster-pool = use "cluster-pool" IP address management:
+    #                                Cilium manages its own pool of pod IPs
+    # --set ipam.operator.clusterPoolIPv4PodCIDRList = the IP range for pods (from group_vars)
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
-  when: cilium_status.rc != 0
-  changed_when: true
+  when: cilium_status.rc != 0   # Only install if Cilium isn't already installed
+  changed_when: true            # This always makes a change (it installs software)
   tags: [master, cilium]
 
 # ── Wait for control plane ────────────────────────────────────────────────
+
+# Task: Wait until the Kubernetes control plane pods are all Running.
+# After kubeadm init and Cilium install, the system needs time to pull images
+# and start containers. This task waits until at least 4 pods are Running.
+# (The 4 minimum: etcd, apiserver, controller-manager, scheduler)
 - name: Wait for all control-plane pods to be Running
   command: >
+    # kubectl get pods -n kube-system = list all pods in the system namespace
+    # --field-selector=status.phase=Running = only show pods that ARE running (not pending/crashed)
+    # --no-headers = skip the column header row (makes counting easier)
     kubectl get pods -n kube-system
     --field-selector=status.phase=Running
     --no-headers
   environment:
     KUBECONFIG: /etc/kubernetes/admin.conf
-  register: cp_pods
-  until: cp_pods.stdout_lines | length >= 4
-  retries: 24
-  delay: 15
-  changed_when: false
+  register: cp_pods                              # Save the output
+  until: cp_pods.stdout_lines | length >= 4      # Keep retrying until at least 4 pods are Running
+  retries: 24    # Try up to 24 times
+  delay: 15      # Wait 15 seconds between retries (24 × 15s = up to 6 minutes)
+  changed_when: false   # Read-only task
   tags: [master]
 
 # ── Generate join command for workers ─────────────────────────────────────
-# Always generate a fresh token so workers can join even on re-runs.
-# Tokens are short-lived (kubeadm_token_ttl) and safe to recreate.
+
+# Task: Create a join token and get the full join command for workers to use.
+# kubeadm join command = a single command that a worker runs to connect to this cluster.
+# It contains: the API server address, a token (temporary password), and a cert hash.
+# We always generate a fresh token so this works on re-runs too.
 - name: Generate kubeadm join command
   command: kubeadm token create --print-join-command --ttl {{ kubeadm_token_ttl }}
-  register: join_command_raw
-  changed_when: false
+  # kubeadm token create = create a new bootstrap token
+  # --print-join-command = also print the complete "kubeadm join ..." command
+  # --ttl 24h            = this token expires in 24 hours (from group_vars/all.yml)
+  register: join_command_raw   # Save the output — it's the full "kubeadm join ..." command
+  changed_when: false          # Creating a token is expected behavior, not a "change" per se
   tags: [master]
 
+# Task: Save the join command as a "fact" (variable) on this host.
+# Why? The worker role needs this command but runs on a different computer.
+# Ansible's hostvars allows tasks on worker computers to read facts from the master.
+# The worker role accesses it as: hostvars[groups['masters'][0]].kubeadm_join_command
 - name: Store join command as host fact
   set_fact:
     kubeadm_join_command: "{{ join_command_raw.stdout }}"
-  tags: [master, always]
+    # join_command_raw.stdout = the text output of the kubeadm token create command
+    # Looks like: "kubeadm join 192.168.1.10:6443 --token abc123 --discovery-token-ca-cert-hash sha256:..."
+  tags: [master, always]   # "always" = this fact is needed even when running other tags
 
 # ── Fetch kubeconfig to control machine ──────────────────────────────────
+
+# Task: Download the kubeconfig from the master to your LOCAL computer (where Ansible runs).
+# This is the "internal" kubeconfig — uses the master's internal IP.
+# Good for use from inside the same network. The next tasks create a version with public IP.
 - name: Fetch kubeconfig to control machine
   fetch:
-    src: /etc/kubernetes/admin.conf
-    dest: "{{ playbook_dir }}/kubeconfig-internal"
-    flat: true
-    mode: "0600"
+    src: /etc/kubernetes/admin.conf      # The file on the remote (master) computer to download
+    dest: "{{ playbook_dir }}/kubeconfig-internal"   # Where to save it on your LOCAL computer
+    flat: true    # flat: true = save directly to the dest path (not into a subdirectory named by host)
+    mode: "0600"  # Restrictive permissions — this file has cluster admin credentials
   tags: [master, kubeconfig]
 
+# Task: Copy kubeconfig-internal to "kubeconfig" on your local computer.
+# We make a copy because we'll modify it (patch the IP) while keeping the original.
 - name: Create external kubeconfig (public IP) for kubectl outside the cluster
-  delegate_to: localhost
-  become: false
+  delegate_to: localhost   # Run this task on YOUR local computer (not on the master)
+  become: false            # Don't use sudo on your local computer
   copy:
-    src: "{{ playbook_dir }}/kubeconfig-internal"
-    dest: "{{ playbook_dir }}/kubeconfig"
+    src: "{{ playbook_dir }}/kubeconfig-internal"   # Source: the internal kubeconfig we just fetched
+    dest: "{{ playbook_dir }}/kubeconfig"            # Destination: the external kubeconfig
     mode: "0600"
   tags: [master, kubeconfig]
 
+# Task: Replace the internal IP with the public IP in the external kubeconfig (AWS only).
+# On AWS, the master's internal IP (like 10.0.1.5) isn't reachable from your laptop.
+# You need to use the public IP (like 54.12.34.56) to connect from outside AWS.
+# This task modifies the kubeconfig file to use the public IP instead.
 - name: Patch external kubeconfig to use public IP (AWS)
-  delegate_to: localhost
+  delegate_to: localhost   # Run on YOUR local computer (we're editing the local kubeconfig)
   become: false
   replace:
-    path: "{{ playbook_dir }}/kubeconfig"
-    regexp: "https://{{ _apiserver_ip }}:6443"
-    replace: "https://{{ _master_public_ip.content }}:6443"
+    path: "{{ playbook_dir }}/kubeconfig"            # The local kubeconfig file to patch
+    regexp: "https://{{ _apiserver_ip }}:6443"        # Find this URL (uses internal IP)
+    replace: "https://{{ _master_public_ip.content }}:6443"   # Replace with public IP URL
   when:
-    - cloud_provider == "aws"
-    - _master_public_ip is not failed
-    - _master_public_ip.content is defined
+    - cloud_provider == "aws"                         # Only on AWS
+    - _master_public_ip is not failed                 # Only if we successfully got the public IP
+    - _master_public_ip.content is defined            # And it's not empty
   tags: [master, kubeconfig]
