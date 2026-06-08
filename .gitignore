@@ -57,6 +57,7 @@ venv/
 
 # ── Kubeconfig (fetched from master by site.yml) ──────────────────────────
 kubeconfig
+kubeconfig-internal
 
 # ── Logs & temp ───────────────────────────────────────────────────────────
 *.log

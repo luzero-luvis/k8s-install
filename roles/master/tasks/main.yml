@@ -10,6 +10,38 @@
     _apiserver_ip: "{{ apiserver_advertise_address if apiserver_advertise_address else ansible_facts['default_ipv4']['address'] }}"
   tags: [master, always]
 
+- name: Fetch public IP via IMDSv2 token (AWS)
+  uri:
+    url: http://169.254.169.254/latest/api/token
+    method: PUT
+    headers:
+      X-aws-ec2-metadata-token-ttl-seconds: "21600"
+    timeout: 5
+  register: _imds_token
+  when: cloud_provider == "aws"
+  failed_when: false
+  tags: [master]
+
+- name: Fetch public IP from IMDSv2 (AWS)
+  uri:
+    url: http://169.254.169.254/latest/meta-data/public-ipv4
+    headers:
+      X-aws-ec2-metadata-token: "{{ _imds_token.content }}"
+    timeout: 5
+  register: _master_public_ip
+  when: cloud_provider == "aws" and _imds_token is not failed
+  failed_when: false
+  tags: [master]
+
+- name: Build certSANs list
+  set_fact:
+    _cert_sans: >-
+      {{
+        ([_apiserver_ip, '127.0.0.1', 'localhost'] + apiserver_extra_sans)
+        + ([_master_public_ip.content] if (cloud_provider == 'aws' and _master_public_ip is not failed and _master_public_ip.content is defined) else [])
+      }}
+  tags: [master, always]
+
 # ── kubeadm init via config file (reproducible, diffable) ─────────────────
 - name: Write kubeadm init config
   template:
@@ -158,7 +190,29 @@
 - name: Fetch kubeconfig to control machine
   fetch:
     src: /etc/kubernetes/admin.conf
-    dest: "{{ playbook_dir }}/kubeconfig"
+    dest: "{{ playbook_dir }}/kubeconfig-internal"
     flat: true
     mode: "0600"
+  tags: [master, kubeconfig]
+
+- name: Create external kubeconfig (public IP) for kubectl outside the cluster
+  delegate_to: localhost
+  become: false
+  copy:
+    src: "{{ playbook_dir }}/kubeconfig-internal"
+    dest: "{{ playbook_dir }}/kubeconfig"
+    mode: "0600"
+  tags: [master, kubeconfig]
+
+- name: Patch external kubeconfig to use public IP (AWS)
+  delegate_to: localhost
+  become: false
+  replace:
+    path: "{{ playbook_dir }}/kubeconfig"
+    regexp: "https://{{ _apiserver_ip }}:6443"
+    replace: "https://{{ _master_public_ip.content }}:6443"
+  when:
+    - cloud_provider == "aws"
+    - _master_public_ip is not failed
+    - _master_public_ip.content is defined
   tags: [master, kubeconfig]

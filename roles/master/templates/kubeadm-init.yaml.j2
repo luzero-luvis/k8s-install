@@ -21,13 +21,11 @@ networking:
   dnsDomain: cluster.local
   podSubnet: "{{ pod_network_cidr }}"
   serviceSubnet: "{{ service_cidr }}"
-{% if apiserver_extra_sans | length > 0 %}
 apiServer:
   certSANs:
-{% for san in apiserver_extra_sans %}
+{% for san in _cert_sans %}
     - "{{ san }}"
 {% endfor %}
-{% endif %}
 ---
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
